@@ -64,3 +64,6 @@ coverage/
 .scount/    # example
 
 # End of .gitignore
+
+# Keep empty build dir in repo (allow .gitkeep). We still ignore other build outputs.
+!/build/.gitkeep
