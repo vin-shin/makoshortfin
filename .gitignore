@@ -1,0 +1,66 @@
+# Build artifacts
+/build/
+/build/**
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/compile_commands.json
+/Makefile
+/build.ninja
+/*.ninja
+
+# Binary and map files
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.axf
+
+# Object and temporary files
+*.o
+*.obj
+*.a
+*.lib
+*.d
+*.tmp
+*.log
+
+# Linker scripts and generated files you may want to keep are in repo
+# Keep linker script unless you intentionally want to ignore it
+
+# IDE/editor folders
+.vscode/
+.idea/
+*.suo
+*.user
+*.user.*
+*.swp
+*~
+
+# Windows thumbnail/db files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# VS/VisualStudio
+.vs/
+
+# Coverage and temporary files
+coverage/
+*.cover
+
+# Do not ignore source directories (Core, Drivers, cmake, etc.)
+# Keep these in repo, they are important for builds across stations
+
+# OneDrive / OS-specific sync files
+*.lnk
+
+# Toolchain caches (optional - adjust if you want to keep)
+.scount/    # example
+
+# End of .gitignore
