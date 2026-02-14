@@ -61,6 +61,14 @@
 #define A1333_CS_PORT GPIOA
 #define A1333_CS_PIN GPIO_PIN_15
 
+/* Open-loop test parameters */
+#define OL_VQ             1.5f       /* Voltage magnitude in volts (q-axis) */
+#define OL_VD             0.0f       /* d-axis voltage (keep 0 for torque-producing) */
+#define OL_SPEED_RAD_S    10.0f      /* Electrical rad/s for open-loop sweep */
+#define OL_ALIGN_TIME_MS  2000U      /* Rotor alignment hold time in ms */
+#define OL_ALIGN_VOLTAGE  1.5f       /* Voltage during alignment phase */
+#define TIM1_PERIOD       5666U      /* TIM1 ARR value (30 kHz PWM) */
+
 PUTCHAR_PROTOTYPE
 {
     HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
@@ -78,15 +86,7 @@ PUTCHAR_PROTOTYPE
 /* USER CODE BEGIN PV */
 static uint32_t ia_zero_mv = CURRENT_ZERO_MV;
 static uint32_t ib_zero_mv = CURRENT_ZERO_MV;
-static uint32_t ic_zero_mv = CURRENT_ZERO_MV;
 
-static volatile float iir_alpha = 0.15f;
-
-static float ia_mv_f = 0.0f;
-static float ib_mv_f = 0.0f;
-static float ic_mv_f = 0.0f;
-static float bus_mv_f = 0.0f;
-static uint8_t filt_ready = 0;
 
 static volatile uint32_t adc_dual_raw = 0;
 
@@ -95,10 +95,11 @@ static A1333_Handle angle_sensor;
 static uint16_t encoder_angle_raw = 0;
 static float encoder_angle_deg = 0.0f;
 static int16_t encoder_angle_prev = 0;
-static float encoder_speed = 0.0f;  // rad/s
 static uint32_t encoder_last_time = 0;
 
-/* Motor commutation variables removed for clean slate */
+/* Open-loop state */
+static float ol_electrical_angle = 0.0f;
+static uint32_t ol_start_time = 0;
 
 /* USER CODE END PV */
 
@@ -109,17 +110,6 @@ void UART_Send(char* message) {
     HAL_UART_Transmit(&huart1, (uint8_t*)message, strlen(message), HAL_MAX_DELAY);
 }
 
-void Filter_SetAlpha(float alpha)
-{
-  if (alpha < 0.0f) alpha = 0.0f;
-  if (alpha > 1.0f) alpha = 1.0f;
-  iir_alpha = alpha;
-}
-
-float Filter_GetAlpha(void)
-{
-  return (float)iir_alpha;
-}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -165,23 +155,62 @@ static void AutoZeroCurrents(void)
   ib_zero_mv = (uint32_t)(sum_ib / samples);
 }
 
-static void UpdateMovingAverage(uint32_t ia_mv, uint32_t ib_mv, uint32_t ic_mv, uint32_t bus_mv)
-{
-  if (!filt_ready)
-  {
-    ia_mv_f = (float)ia_mv;
-    ib_mv_f = (float)ib_mv;
-    ic_mv_f = (float)ic_mv;
-    bus_mv_f = (float)bus_mv;
-    filt_ready = 1U;
-    return;
-  }
 
-  float alpha = (float)iir_alpha;
-  ia_mv_f += alpha * ((float)ia_mv - ia_mv_f);
-  ib_mv_f += alpha * ((float)ib_mv - ib_mv_f);
-  ic_mv_f += alpha * ((float)ic_mv - ic_mv_f);
-  bus_mv_f += alpha * ((float)bus_mv - bus_mv_f);
+static void SetPwmDuties(float du, float dv, float dw)
+{
+  if (du < 0.0f) { du = 0.0f; } if (du > 1.0f) { du = 1.0f; }
+  if (dv < 0.0f) { dv = 0.0f; } if (dv > 1.0f) { dv = 1.0f; }
+  if (dw < 0.0f) { dw = 0.0f; } if (dw > 1.0f) { dw = 1.0f; }
+
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)(du * (float)TIM1_PERIOD));
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)(dv * (float)TIM1_PERIOD));
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)(dw * (float)TIM1_PERIOD));
+}
+
+static void EnablePwmOutputs(void)
+{
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
+}
+
+__attribute__((unused)) static void DisablePwmOutputs(void)
+{
+  HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+  HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
+  HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_2);
+  HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_3);
+}
+
+static void OpenLoopSVPWM(float vd, float vq, float elec_angle, float bus_v, float *du, float *dv, float *dw)
+{
+  float sin_t, cos_t;
+  FOC_SinCos(elec_angle, &sin_t, &cos_t);
+
+  float v_alpha = vd * cos_t - vq * sin_t;
+  float v_beta  = vd * sin_t + vq * cos_t;
+
+  float v_u = v_alpha;
+  float v_v = -0.5f * v_alpha + 0.866025404f * v_beta;
+  float v_w = -0.5f * v_alpha - 0.866025404f * v_beta;
+
+  /* SVPWM center-clamping */
+  float v_max = v_u > v_v ? v_u : v_v; if (v_w > v_max) v_max = v_w;
+  float v_min = v_u < v_v ? v_u : v_v; if (v_w < v_min) v_min = v_w;
+  float v_offset = 0.5f * (v_max + v_min);
+  v_u -= v_offset;
+  v_v -= v_offset;
+  v_w -= v_offset;
+
+  float inv_bus = 1.0f / bus_v;
+  *du = 0.5f + v_u * inv_bus;
+  *dv = 0.5f + v_v * inv_bus;
+  *dw = 0.5f + v_w * inv_bus;
 }
 
 /* USER CODE END 0 */
@@ -225,181 +254,140 @@ int main(void)
   MX_OPAMP3_Init();
   /* USER CODE BEGIN 2 */
   UART_Send("Hello, Mako Shortfin!\n");
-  UART_Send("System init\r\n");
-    
-    // Test with printf (after retargeting)
-    printf("Clock: %lu Hz\r\n", SystemCoreClock);
-  
-  /* A1333 Encoder Initialization */
-  printf("A1333 encoder init\r\n");
+  printf("Clock: %lu Hz\r\n", SystemCoreClock);
+  printf("=== Open-Loop FOC Spin Test ===\r\n");
+  printf("Vq=1.5V  Speed=10 rad/s  Poles=%u\r\n", FOC_POLE_PAIRS);
 
   FOC_Init();
   FOC_SetPolePairs(FOC_POLE_PAIRS);
-  
+
+  /* A1333 Encoder Init */
   A1333_Status a1333_status = A1333_Init(&angle_sensor, &hspi3, A1333_CS_PORT, A1333_CS_PIN);
   if (a1333_status != A1333_OK)
   {
-    printf("A1333 init failed! Status: %d\r\n", a1333_status);
+    printf("A1333 init FAILED (%d)\r\n", a1333_status);
   }
   else
   {
     printf("A1333 init OK\r\n");
-    
-    // Clear RST flag (always set after power-on)
     A1333_ClearErrors(&angle_sensor);
     A1333_ClearWarnings(&angle_sensor);
-    
-    // Wait for angle to become valid
+
     bool valid = false;
     for (int i = 0; i < 20 && !valid; i++)
     {
       A1333_IsAngleValid(&angle_sensor, &valid);
       HAL_Delay(10);
     }
-    
-    // Read initial angle
-    if (A1333_ReadAngle15(&angle_sensor, &encoder_angle_raw, &encoder_angle_deg) == A1333_OK)
-    {
-      encoder_angle_prev = (int16_t)encoder_angle_raw;
-      encoder_last_time = HAL_GetTick();
-      printf("A1333 initial: %u raw, %.2f deg\r\n", encoder_angle_raw, encoder_angle_deg);
-    }
-    
-    // Read diagnostics
-    uint16_t status, errors;
-    A1333_ReadStatus(&angle_sensor, &status);
-    A1333_ReadErrors(&angle_sensor, &errors);
-    printf("Status: 0x%04X, Errors: 0x%04X\r\n", status, errors);
+    A1333_ReadAngle15(&angle_sensor, &encoder_angle_raw, &encoder_angle_deg);
+    encoder_angle_prev = (int16_t)encoder_angle_raw;
+    encoder_last_time = HAL_GetTick();
   }
 
-    uint32_t last_print_ms = 0;
-    uint32_t last_encoder_ms = 0;
+  /* Start OPAMP, calibrate ADCs */
+  if (HAL_OPAMP_Start(&hopamp3) != HAL_OK) Error_Handler();
+  if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK) Error_Handler();
+  if (HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED) != HAL_OK) Error_Handler();
 
-    if (HAL_OPAMP_Start(&hopamp3) != HAL_OK)
-    {
-      Error_Handler();
-    }
-    if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK)
-    {
-      Error_Handler();
-    }
-    if (HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED) != HAL_OK)
-    {
-      Error_Handler();
-    }
+  /* Start TIM1 base + CH4 (ADC trigger) */
+  if (HAL_TIM_Base_Start(&htim1) != HAL_OK) Error_Handler();
+  if (HAL_TIM_OC_Start(&htim1, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
 
-    if (HAL_TIM_Base_Start(&htim1) != HAL_OK)
-    {
-      Error_Handler();
-    }
-    if (HAL_TIM_OC_Start(&htim1, TIM_CHANNEL_4) != HAL_OK)
-    {
-      Error_Handler();
-    }
+  /* Start dual ADC DMA */
+  if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)&adc_dual_raw, 1) != HAL_OK) Error_Handler();
+  if (hadc1.DMA_Handle != NULL)
+  {
+    __HAL_DMA_DISABLE_IT(hadc1.DMA_Handle, DMA_IT_TC | DMA_IT_HT | DMA_IT_TE);
+  }
 
-    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)&adc_dual_raw, 1) != HAL_OK)
-    {
-      Error_Handler();
-    }
-    if (hadc1.DMA_Handle != NULL)
-    {
-      __HAL_DMA_DISABLE_IT(hadc1.DMA_Handle, DMA_IT_TC | DMA_IT_HT | DMA_IT_TE);
-    }
+  HAL_Delay(50);
+  AutoZeroCurrents();
+  printf("ADC zeroed: Ia=%lu mV  Ib=%lu mV\r\n", ia_zero_mv, ib_zero_mv);
 
-    HAL_Delay(50);
+  /* ---- Phase 1: Alignment ---- */
+  printf("Aligning rotor to electrical angle 0...\r\n");
+  SetPwmDuties(0.5f, 0.5f, 0.5f);
+  EnablePwmOutputs();
 
-    AutoZeroCurrents();
+  /* Read bus voltage for SVPWM scaling */
+  uint32_t raw_opamp = ReadAdcInjectedCounts(&hadc1);
+  float bus_v = (float)(AdcCountsToMv(raw_opamp) * 21U) * 0.001f;
+  if (bus_v < 5.0f) bus_v = 16.0f;  /* fallback if not reading yet */
+  printf("Bus voltage: %ld.%01ld V\r\n", (int32_t)bus_v, (int32_t)((bus_v - (int32_t)bus_v) * 10.0f));
 
-    printf("ADC dual-sampling @ 30kHz (TIM1_TRGO2)\r\n");
+  {
+    float du, dv, dw;
+    OpenLoopSVPWM(0.0f, OL_ALIGN_VOLTAGE, 0.0f, bus_v, &du, &dv, &dw);
+    SetPwmDuties(du, dv, dw);
+  }
+  HAL_Delay(OL_ALIGN_TIME_MS);
+  printf("Alignment done. Starting open-loop spin.\r\n");
+
+  /* ---- Phase 2: Open-loop spin ---- */
+  ol_electrical_angle = 0.0f;
+  ol_start_time = HAL_GetTick();
+
+  uint32_t last_print_ms = HAL_GetTick();
+  uint32_t last_loop_ms = HAL_GetTick();
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-     while (1)
+  while (1)
   {
     /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
     uint32_t now = HAL_GetTick();
+    uint32_t dt_ms = now - last_loop_ms;
+    if (dt_ms == 0) dt_ms = 1;
+    last_loop_ms = now;
 
-    /* Read A1333 encoder continuously for smooth commutation */
+    /* Advance electrical angle */
+    float dt_s = (float)dt_ms * 0.001f;
+    ol_electrical_angle += OL_SPEED_RAD_S * dt_s;
+    if (ol_electrical_angle > TWO_PI_F) ol_electrical_angle -= TWO_PI_F;
+    if (ol_electrical_angle < 0.0f)     ol_electrical_angle += TWO_PI_F;
+
+    /* Re-read bus voltage periodically */
+    raw_opamp = ReadAdcInjectedCounts(&hadc1);
+    bus_v = (float)(AdcCountsToMv(raw_opamp) * 21U) * 0.001f;
+    if (bus_v < 5.0f) bus_v = 16.0f;
+
+    /* Compute SVPWM and drive motor */
+    float du, dv, dw;
+    OpenLoopSVPWM(OL_VD, OL_VQ, ol_electrical_angle, bus_v, &du, &dv, &dw);
+    SetPwmDuties(du, dv, dw);
+
+    /* Read encoder */
     A1333_ReadAngle15(&angle_sensor, &encoder_angle_raw, &encoder_angle_deg);
-    
-    /* Calculate velocity every 50ms */
-    if ((now - last_encoder_ms) >= 50U)
-    {
-      last_encoder_ms = now;
-      
-      // Calculate velocity
-      int32_t delta = (int16_t)encoder_angle_raw - encoder_angle_prev;
-      if (delta > 16384) delta -= 32768;
-      else if (delta < -16384) delta += 32768;
-      
-      if (encoder_last_time > 0 && now > encoder_last_time)
-      {
-        uint32_t dt_ms = now - encoder_last_time;
-        float new_speed = (float)delta * 0.000191747f / ((float)dt_ms * 0.001f);
-        encoder_speed += (new_speed - encoder_speed) * 0.1f;
-      }
-      
-      encoder_angle_prev = (int16_t)encoder_angle_raw;
-      encoder_last_time = now;
-    }
 
-    /* Print combined status every 200ms */
+    /* Telemetry every 200ms */
     if ((now - last_print_ms) >= 200U)
     {
       last_print_ms = now;
+
+      /* Read phase currents */
       uint32_t raw = adc_dual_raw;
       uint16_t raw_ia = (uint16_t)(raw & 0xFFFF);
       uint16_t raw_ib = (uint16_t)(raw >> 16);
-      uint32_t raw_opamp = ReadAdcInjectedCounts(&hadc1);
-
       uint32_t mv_ia = AdcCountsToMv(raw_ia);
       uint32_t mv_ib = AdcCountsToMv(raw_ib);
       int32_t ia_ma = ((int32_t)mv_ia - (int32_t)ia_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
       int32_t ib_ma = ((int32_t)mv_ib - (int32_t)ib_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
       int32_t ic_ma = -(ia_ma + ib_ma);
-      int32_t mv_ic = (int32_t)ic_zero_mv + (ic_ma * CURRENT_SENSE_MV_PER_A) / 1000;
-      if (mv_ic < 0) mv_ic = 0;
-      if (mv_ic > (int32_t)ADC_VREF_MV) mv_ic = ADC_VREF_MV;
 
-      uint32_t mv_opamp = AdcCountsToMv(raw_opamp);
-      uint32_t mv_bus = mv_opamp * 21U;
+      int32_t el_deg = (int32_t)(ol_electrical_angle * 57.2957795f);
+      int32_t bus_int = (int32_t)bus_v;
+      int32_t bus_frac = (int32_t)((bus_v - (float)bus_int) * 10.0f);
+      int32_t enc_int = (int32_t)encoder_angle_deg;
 
-      float mech_angle_rad = ((float)encoder_angle_raw * TWO_PI_F) / ENCODER_COUNTS_PER_REV;
-      float elec_angle_rad = mech_angle_rad * (float)FOC_POLE_PAIRS;
-      FOC_SensorData foc_data = {
-        .ia = (float)ia_ma * 0.001f,
-        .ib = (float)ib_ma * 0.001f,
-        .ic = (float)ic_ma * 0.001f,
-        .bus_v = (float)mv_bus * 0.001f,
-        .electrical_angle = elec_angle_rad
-      };
-      FOC_UpdateSensors(&foc_data);
+      int32_t du_pct = (int32_t)(du * 100.0f);
+      int32_t dv_pct = (int32_t)(dv * 100.0f);
+      int32_t dw_pct = (int32_t)(dw * 100.0f);
 
-      UpdateMovingAverage(mv_ia, mv_ib, (uint32_t)mv_ic, mv_bus);
-
-      if (filt_ready)
-      {
-        int32_t ia_ma_avg = ((int32_t)ia_mv_f - (int32_t)ia_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
-        int32_t ib_ma_avg = ((int32_t)ib_mv_f - (int32_t)ib_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
-        int32_t ic_ma_avg = ((int32_t)ic_mv_f - (int32_t)ic_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
-
-        uint32_t bus_v = (uint32_t)bus_mv_f / 1000U;
-        uint32_t bus_mv_rem = (uint32_t)bus_mv_f % 1000U;
-
-        // Convert floats to integers for printf
-        int32_t deg_int = (int32_t)encoder_angle_deg;
-        int32_t deg_frac = (int32_t)((encoder_angle_deg - (float)deg_int) * 10.0f);
-        int32_t speed_int = (int32_t)encoder_speed;
-        int32_t speed_frac = (int32_t)((encoder_speed - (float)speed_int) * 100.0f);
-        if (speed_frac < 0) speed_frac = -speed_frac;
-
-         printf("Ang:%5u(%ld.%1lddeg) Spd:%ld.%02ldrad/s | Iu:%5ldmA Iv:%5ldmA Iw:%5ldmA Bus:%3lu.%03luV\r\n",
-           encoder_angle_raw, deg_int, deg_frac, speed_int, speed_frac,
-           ia_ma_avg, ib_ma_avg, ic_ma_avg, bus_v, bus_mv_rem);
-      }
+      printf("eAng:%4ld  Enc:%4lddeg | Iu:%5ldmA Iv:%5ldmA Iw:%5ldmA | Bus:%ld.%ldV | D:%ld/%ld/%ld%%\r\n",
+             el_deg, enc_int, ia_ma, ib_ma, ic_ma, bus_int, bus_frac, du_pct, dv_pct, dw_pct);
     }
   }
   /* USER CODE END 3 */
