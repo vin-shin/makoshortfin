@@ -30,7 +30,9 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdio.h>
+#include "stm32g4xx_hal_dma.h"
 #include "a1333.h"
+#include "FOC.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -51,7 +53,9 @@
 #define CURRENT_ZERO_MV 2500
 #define CURRENT_SENSE_MV_PER_A 20
 #define OPAMP_ADC_CHANNEL ADC_CHANNEL_12
-#define AVG_WINDOW 64U
+#define FOC_POLE_PAIRS 20U
+#define ENCODER_COUNTS_PER_REV 32768.0f
+#define TWO_PI_F 6.28318530718f
 
 /* A1333 CS pin on PA15 (for SPI3) */
 #define A1333_CS_PORT GPIOA
@@ -76,16 +80,15 @@ static uint32_t ia_zero_mv = CURRENT_ZERO_MV;
 static uint32_t ib_zero_mv = CURRENT_ZERO_MV;
 static uint32_t ic_zero_mv = CURRENT_ZERO_MV;
 
-static uint32_t ia_mv_buf[AVG_WINDOW] = {0};
-static uint32_t ib_mv_buf[AVG_WINDOW] = {0};
-static uint32_t ic_mv_buf[AVG_WINDOW] = {0};
-static uint32_t bus_mv_buf[AVG_WINDOW] = {0};
-static uint32_t avg_index = 0;
-static uint32_t avg_count = 0;
-static uint32_t ia_mv_sum = 0;
-static uint32_t ib_mv_sum = 0;
-static uint32_t ic_mv_sum = 0;
-static uint32_t bus_mv_sum = 0;
+static volatile float iir_alpha = 0.15f;
+
+static float ia_mv_f = 0.0f;
+static float ib_mv_f = 0.0f;
+static float ic_mv_f = 0.0f;
+static float bus_mv_f = 0.0f;
+static uint8_t filt_ready = 0;
+
+static volatile uint32_t adc_dual_raw = 0;
 
 /* A1333 Encoder Variables */
 static A1333_Handle angle_sensor;
@@ -95,28 +98,7 @@ static int16_t encoder_angle_prev = 0;
 static float encoder_speed = 0.0f;  // rad/s
 static uint32_t encoder_last_time = 0;
 
-/* Motor Control Variables */
-// *** ADJUST THESE SETTINGS FOR YOUR MOTOR ***
-#define MOTOR_POLE_PAIRS 20          // Number of pole pairs (confirmed: 20)
-static uint32_t motor_duty_percent = 20;  // Starting duty cycle (5-50%)
-static int8_t motor_direction = 1;        // 1 for forward, -1 for reverse
-
-// Encoder offset and direction
-// Set force_encoder_direction = 1 to manually override auto-detection
-static uint8_t force_encoder_direction = 1;  // 1 = override, 0 = use auto-detection
-static int8_t encoder_direction_override = -1;  // Manual: 1 = normal, -1 = inverted
-static int16_t encoder_offset = 0;
-static int8_t encoder_direction = 1;     // Auto-detected value
-
-// Test mode
-static uint8_t open_loop_test = 0;       // 1 = open-loop test, 0 = closed-loop with encoder
-static uint8_t skip_calibration = 0;     // 0 = run calibration (recommended), 1 = skip
-
-// Internal variables
-static uint32_t pwm_period = 0;
-static uint8_t motor_enabled = 0;
-static uint8_t last_sector = 0xFF;       // Track sector changes
-static uint16_t open_loop_angle = 0;     // Simulated angle for open-loop
+/* Motor commutation variables removed for clean slate */
 
 /* USER CODE END PV */
 
@@ -126,37 +108,35 @@ void SystemClock_Config(void);
 void UART_Send(char* message) {
     HAL_UART_Transmit(&huart1, (uint8_t*)message, strlen(message), HAL_MAX_DELAY);
 }
+
+void Filter_SetAlpha(float alpha)
+{
+  if (alpha < 0.0f) alpha = 0.0f;
+  if (alpha > 1.0f) alpha = 1.0f;
+  iir_alpha = alpha;
+}
+
+float Filter_GetAlpha(void)
+{
+  return (float)iir_alpha;
+}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-static uint32_t ReadAdcCounts(ADC_HandleTypeDef *hadc, uint32_t channel)
+static uint32_t ReadAdcInjectedCounts(ADC_HandleTypeDef *hadc)
 {
-  ADC_ChannelConfTypeDef sConfig = {0};
-
-  sConfig.Channel = channel;
-  sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
-  sConfig.SingleDiff = ADC_SINGLE_ENDED;
-  sConfig.OffsetNumber = ADC_OFFSET_NONE;
-  sConfig.Offset = 0;
-
-  if (HAL_ADC_ConfigChannel(hadc, &sConfig) != HAL_OK)
+  if (HAL_ADCEx_InjectedStart(hadc) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_ADC_Start(hadc) != HAL_OK)
+  if (HAL_ADCEx_InjectedPollForConversion(hadc, 10) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_ADC_PollForConversion(hadc, 10) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  uint32_t value = HAL_ADC_GetValue(hadc);
-  HAL_ADC_Stop(hadc);
+  uint32_t value = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
+  HAL_ADCEx_InjectedStop(hadc);
   return value;
 }
 
@@ -167,273 +147,41 @@ static uint32_t AdcCountsToMv(uint32_t counts)
 
 static void AutoZeroCurrents(void)
 {
-  const uint32_t samples = 256U;
+  const uint32_t samples = 512U;
   uint64_t sum_ia = 0;
   uint64_t sum_ib = 0;
-  uint64_t sum_ic = 0;
 
   for (uint32_t i = 0; i < samples; ++i)
   {
-    sum_ia += AdcCountsToMv(ReadAdcCounts(&hadc1, ADC_CHANNEL_1));
-    sum_ib += AdcCountsToMv(ReadAdcCounts(&hadc2, ADC_CHANNEL_3));
-    sum_ic += AdcCountsToMv(ReadAdcCounts(&hadc2, ADC_CHANNEL_4));
+    uint32_t raw = adc_dual_raw;
+    uint16_t ia_raw = (uint16_t)(raw & 0xFFFF);
+    uint16_t ib_raw = (uint16_t)(raw >> 16);
+    sum_ia += AdcCountsToMv(ia_raw);
+    sum_ib += AdcCountsToMv(ib_raw);
+    HAL_Delay(1);
   }
 
   ia_zero_mv = (uint32_t)(sum_ia / samples);
   ib_zero_mv = (uint32_t)(sum_ib / samples);
-  ic_zero_mv = (uint32_t)(sum_ic / samples);
 }
 
 static void UpdateMovingAverage(uint32_t ia_mv, uint32_t ib_mv, uint32_t ic_mv, uint32_t bus_mv)
 {
-  if (avg_count < AVG_WINDOW)
+  if (!filt_ready)
   {
-    avg_count++;
-  }
-  else
-  {
-    ia_mv_sum -= ia_mv_buf[avg_index];
-    ib_mv_sum -= ib_mv_buf[avg_index];
-    ic_mv_sum -= ic_mv_buf[avg_index];
-    bus_mv_sum -= bus_mv_buf[avg_index];
+    ia_mv_f = (float)ia_mv;
+    ib_mv_f = (float)ib_mv;
+    ic_mv_f = (float)ic_mv;
+    bus_mv_f = (float)bus_mv;
+    filt_ready = 1U;
+    return;
   }
 
-  ia_mv_buf[avg_index] = ia_mv;
-  ib_mv_buf[avg_index] = ib_mv;
-  ic_mv_buf[avg_index] = ic_mv;
-  bus_mv_buf[avg_index] = bus_mv;
-  ia_mv_sum += ia_mv;
-  ib_mv_sum += ib_mv;
-  ic_mv_sum += ic_mv;
-  bus_mv_sum += bus_mv;
-
-  avg_index++;
-  if (avg_index >= AVG_WINDOW)
-  {
-    avg_index = 0;
-  }
-}
-
-/**
- * @brief Robust encoder calibration - finds offset algorithmically
- * @return Calculated encoder offset
- * 
- * Algorithm:
- * 1. Force motor to electrical angle 0 by energizing V+ W- (sector 0 commutation)
- * 2. Wait for rotor to physically align with the magnetic field
- * 3. Read encoder position - this is the mechanical angle when electrical = 0
- * 4. Calculate offset so that: (measured_angle + offset) * pole_pairs ≡ 0 (mod 32768)
- * 5. Simplest solution: offset = -measured_angle
- */
-static int16_t CalibrateEncoderOffset(void)
-{
-  printf("\r\n=== Algorithmic Encoder Calibration ===\r\n");
-  printf("Step 1: Forcing motor to electrical angle 0 (V+ W-)...\r\n");
-  
-  // Force specific commutation: V+ W- (sector 0, electrical angle ~0-60°)
-  // Use strong torque to overcome any friction
-  uint32_t align_duty = (pwm_period * 40) / 100;  // 40% duty
-  
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, align_duty);      // V = HIGH (100% duty)
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);               // W = LOW (0% duty)
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pwm_period/2);    // U = FLOAT (50% - no current)
-  
-  printf("Step 2: Waiting for rotor to settle (2.5s)...\r\n");
-  HAL_Delay(2500);  // Generous settling time
-  
-  printf("Step 3: Reading encoder position...\r\n");
-  
-  // Read encoder multiple times and average for accuracy
-  uint32_t angle_sum = 0;
-  const uint8_t samples = 30;
-  
-  for (uint8_t i = 0; i < samples; i++)
-  {
-    uint16_t raw_angle;
-    float deg;
-    if (A1333_ReadAngle15(&angle_sensor, &raw_angle, &deg) == A1333_OK)
-    {
-      angle_sum += raw_angle;
-    }
-    HAL_Delay(10);
-  }
-  
-  uint16_t measured_angle = (uint16_t)(angle_sum / samples);
-  
-  printf("Step 4: Calculating offset...\r\n");
-  
-  // The rotor is now physically aligned to electrical angle 0
-  // We want: (encoder_reading + offset) * pole_pairs ≡ 0 (mod 32768)
-  // Solution: offset = -encoder_reading
-  // This makes adjusted_angle = 0, so electrical_angle = 0
-  int16_t calculated_offset = -(int16_t)measured_angle;
-  
-  // Verify the calculation
-  uint16_t test_adjusted = (measured_angle + calculated_offset) & 0x7FFF;
-  uint32_t test_electrical = ((uint32_t)test_adjusted * MOTOR_POLE_PAIRS) % 32768;
-  
-  // Turn off alignment - all phases floating
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_period/2);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_period/2);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pwm_period/2);
-  
-  printf("\\r\\nCalibration Results:\\r\\n");
-  printf("  Measured mechanical angle: %u (%.1f° mech)\\r\\n", 
-         measured_angle, (float)measured_angle * 360.0f / 32768.0f);
-  printf("  Calculated offset: %d\\r\\n", calculated_offset);
-  printf("  Verification - Electrical angle: %lu (should be ~0)\\r\\n", test_electrical);
-  
-  // Step 5: Detect encoder direction by forcing next sector
-  printf("\\r\\nStep 5: Detecting encoder direction...\\r\\n");
-  printf("  Forcing next sector (V+ U-) for 1 second...\\r\\n");
-  
-  // Force sector 1: V+ U-
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, align_duty);      // V = HIGH
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_period/2);    // W = FLOAT
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);               // U = LOW
-  
-  HAL_Delay(1000);  // Let motor settle
-  
-  // Read encoder in new position
-  uint32_t angle_sum2 = 0;
-  for (uint8_t i = 0; i < samples; i++)
-  {
-    uint16_t raw_angle;
-    float deg;
-    if (A1333_ReadAngle15(&angle_sensor, &raw_angle, &deg) == A1333_OK)
-    {
-      angle_sum2 += raw_angle;
-    }
-    HAL_Delay(10);
-  }
-  uint16_t measured_angle2 = (uint16_t)(angle_sum2 / samples);
-  
-  // Calculate delta (accounting for wraparound)
-  int32_t delta = (int32_t)measured_angle2 - (int32_t)measured_angle;
-  if (delta > 16384) delta -= 32768;
-  else if (delta < -16384) delta += 32768;
-  
-  // Detect direction: if motor advanced electrically forward and encoder increased, direction is normal
-  // Sector 0->1 is forward electrical rotation
-  if (delta > 0)
-  {
-    encoder_direction = 1;  // Encoder increases with forward electrical rotation
-    printf("  Encoder direction: NORMAL (encoder increases with forward rotation)\\r\\n");
-  }
-  else if (delta < 0)
-  {
-    encoder_direction = -1;  // Encoder decreases with forward electrical rotation
-    printf("  Encoder direction: INVERTED (encoder decreases with forward rotation)\\r\\n");
-  }
-  else
-  {
-    encoder_direction = 1;  // Default to normal if no change detected
-    printf("  Encoder direction: UNKNOWN (no movement detected, assuming normal)\\r\\n");
-  }
-  
-  // Turn off alignment - all phases floating
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_period/2);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_period/2);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pwm_period/2);
-  
-  printf("  Motor released.\\r\\n");
-  
-  return calculated_offset;
-}
-
-/**
- * @brief 6-step commutation control
- * @param angle_raw: Encoder angle (0-32767)
- * @param duty: PWM duty value (0 to pwm_period)
- * 
- * Phase mapping:
- * - Phase U = TIM1_CH3 (PA10/PB15)
- * - Phase V = TIM1_CH1 (PA8/PA11)
- * - Phase W = TIM1_CH2 (PA9/PA12)
- */
-static void Motor_Commutate(uint16_t angle_raw, uint32_t duty)
-{
-  // Determine which encoder direction to use
-  int8_t active_encoder_dir = force_encoder_direction ? encoder_direction_override : encoder_direction;
-  
-  // Apply encoder direction (invert if encoder direction is opposite to motor)
-  uint16_t corrected_angle = angle_raw;
-  if (active_encoder_dir < 0)
-  {
-    corrected_angle = 32768 - angle_raw;  // Invert encoder direction
-  }
-  
-  // Apply encoder offset and calculate electrical angle
-  uint16_t adjusted_angle = (corrected_angle + encoder_offset) & 0x7FFF;
-  uint32_t elec_angle = ((uint32_t)adjusted_angle * MOTOR_POLE_PAIRS) % 32768;
-  
-  // Determine sector (0-5) based on electrical angle
-  // Each sector is 60 degrees = 32768/6 = 5461.33 counts
-  uint8_t sector = (uint8_t)((elec_angle * 6) / 32768);
-  
-  // Bounds check
-  if (sector > 5) sector = 5;
-  
-  // Apply motor direction
-  if (motor_direction < 0)
-  {
-    sector = (6 - sector) % 6;
-  }
-  
-  // Debug output when sector changes (helps diagnose commutation issues)
-  static uint32_t last_debug_print = 0;
-  uint32_t now = HAL_GetTick();
-  if (sector != last_sector && (now - last_debug_print) > 100)
-  {
-    last_sector = sector;
-    last_debug_print = now;
-    printf("Sec:%u Elec:%lu Mech:%u Raw:%u Off:%d\r\n", 
-           sector, elec_angle, adjusted_angle, angle_raw, encoder_offset);
-  }
-  
-  uint32_t duty_on = duty;
-  uint32_t duty_off = 0;
-  
-  // 6-step commutation table
-  // Each sector: one phase HIGH, one phase LOW, one phase FLOATING (PWM at 50%)
-  switch (sector)
-  {
-    case 0:  // V+ W-  (U floating)
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty_on);   // V = CH1 = HIGH
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, duty_off);  // W = CH2 = LOW
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pwm_period/2);  // U = CH3 = FLOAT
-      break;
-      
-    case 1:  // V+ U-  (W floating)
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty_on);   // V = CH1 = HIGH
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_period/2);  // W = CH2 = FLOAT
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, duty_off);  // U = CH3 = LOW
-      break;
-      
-    case 2:  // W+ U-  (V floating)
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_period/2);  // V = CH1 = FLOAT
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, duty_on);   // W = CH2 = HIGH
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, duty_off);  // U = CH3 = LOW
-      break;
-      
-    case 3:  // W+ V-  (U floating)
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty_off);  // V = CH1 = LOW
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, duty_on);   // W = CH2 = HIGH
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pwm_period/2);  // U = CH3 = FLOAT
-      break;
-      
-    case 4:  // U+ V-  (W floating)
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty_off);  // V = CH1 = LOW
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_period/2);  // W = CH2 = FLOAT
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, duty_on);   // U = CH3 = HIGH
-      break;
-      
-    case 5:  // U+ W-  (V floating)
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_period/2);  // V = CH1 = FLOAT
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, duty_off);  // W = CH2 = LOW
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, duty_on);   // U = CH3 = HIGH
-      break;
-  }
+  float alpha = (float)iir_alpha;
+  ia_mv_f += alpha * ((float)ia_mv - ia_mv_f);
+  ib_mv_f += alpha * ((float)ib_mv - ib_mv_f);
+  ic_mv_f += alpha * ((float)ic_mv - ic_mv_f);
+  bus_mv_f += alpha * ((float)bus_mv - bus_mv_f);
 }
 
 /* USER CODE END 0 */
@@ -484,12 +232,14 @@ int main(void)
   
   /* A1333 Encoder Initialization */
   printf("A1333 encoder init\r\n");
+
+  FOC_Init();
+  FOC_SetPolePairs(FOC_POLE_PAIRS);
   
   A1333_Status a1333_status = A1333_Init(&angle_sensor, &hspi3, A1333_CS_PORT, A1333_CS_PIN);
   if (a1333_status != A1333_OK)
   {
     printf("A1333 init failed! Status: %d\r\n", a1333_status);
-    printf("Check: wiring, power, SPI config (Mode 3, 16-bit)\r\n");
   }
   else
   {
@@ -522,20 +272,8 @@ int main(void)
     printf("Status: 0x%04X, Errors: 0x%04X\r\n", status, errors);
   }
 
-    uint32_t arr = 0;
     uint32_t last_print_ms = 0;
     uint32_t last_encoder_ms = 0;
-
-    /* TIM1 runs from APB2 (170 MHz). Prescale to 170 MHz / 170 = 1 MHz, then set 30 kHz PWM. */
-    __HAL_TIM_SET_PRESCALER(&htim1, 169);
-    __HAL_TIM_SET_AUTORELOAD(&htim1, 32);
-    arr = __HAL_TIM_GET_AUTORELOAD(&htim1);
-    pwm_period = arr + 1;  // Store for motor control
-    
-    /* Initialize all phases to 50% (floating) */
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_period/2);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_period/2);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pwm_period/2);
 
     if (HAL_OPAMP_Start(&hopamp3) != HAL_OK)
     {
@@ -550,76 +288,29 @@ int main(void)
       Error_Handler();
     }
 
-    HAL_Delay(500);
+    if (HAL_TIM_Base_Start(&htim1) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    if (HAL_TIM_OC_Start(&htim1, TIM_CHANNEL_4) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)&adc_dual_raw, 1) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    if (hadc1.DMA_Handle != NULL)
+    {
+      __HAL_DMA_DISABLE_IT(hadc1.DMA_Handle, DMA_IT_TC | DMA_IT_HT | DMA_IT_TE);
+    }
+
+    HAL_Delay(50);
+
     AutoZeroCurrents();
 
-    /* Enable gate drivers on PC7, PC8, PC9 */
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_SET);
-    printf("Gate drivers enabled (PC7, PC8, PC9)\r\n");
-
-    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
-    {
-      Error_Handler();
-    }
-    if (HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
-    {
-      Error_Handler();
-    }
-    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK)
-    {
-      Error_Handler();
-    }
-    if (HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2) != HAL_OK)
-    {
-      Error_Handler();
-    }
-    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK)
-    {
-      Error_Handler();
-    }
-    if (HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3) != HAL_OK)
-    {
-      Error_Handler();
-    }
-    
-    /* Run encoder calibration routine */
-    if (open_loop_test)
-    {
-      printf("\r\n=== OPEN-LOOP TEST MODE ===\r\n");
-      printf("Motor will spin slowly without encoder feedback\r\n");
-      printf("This tests basic commutation and wiring\r\n");
-    }
-    else if (skip_calibration)
-    {
-      printf("\r\n=== MANUAL OFFSET MODE ===\r\n");
-      printf("Using manually set encoder offset: %d\r\n", encoder_offset);
-      printf("(Calibration skipped)\r\n");
-    }
-    else
-    {
-      printf("\r\n=== AUTOMATIC CALIBRATION ===\r\n");
-      printf("For custom encoders, this algorithmically finds the offset\r\n");
-      printf("by forcing a known electrical position and measuring encoder.\r\n");
-      encoder_offset = CalibrateEncoderOffset();
-    }
-    
-    printf("\r\n=== Motor Control Ready ===\r\n");
-    printf("Final encoder offset: %d\r\n", encoder_offset);
-    if (force_encoder_direction)
-    {
-      printf("Encoder direction: %s (MANUAL OVERRIDE)\r\n", 
-             encoder_direction_override > 0 ? "NORMAL" : "INVERTED");
-    }
-    else
-    {
-      printf("Encoder direction: %s (auto-detected)\r\n", 
-             encoder_direction > 0 ? "NORMAL" : "INVERTED");
-    }
-    printf("Auto-starting motor in 2 seconds...\r\n");
-    HAL_Delay(2000);
-    motor_enabled = 1;
-    printf("Motor ENABLED at %lu%% duty, motor direction: %s\r\n\r\n",
-           motor_duty_percent, motor_direction > 0 ? "FWD" : "REV");
+    printf("ADC dual-sampling @ 30kHz (TIM1_TRGO2)\r\n");
 
   /* USER CODE END 2 */
 
@@ -634,42 +325,6 @@ int main(void)
     /* Read A1333 encoder continuously for smooth commutation */
     A1333_ReadAngle15(&angle_sensor, &encoder_angle_raw, &encoder_angle_deg);
     
-    /* Motor commutation control - run at high frequency */
-    if (motor_enabled)
-    {
-      // Calculate duty cycle from percentage
-      uint32_t duty_value = (pwm_period * motor_duty_percent) / 100;
-      if (duty_value > pwm_period) duty_value = pwm_period;
-      
-      uint16_t angle_to_use;
-      
-      if (open_loop_test)
-      {
-        // Open-loop test: smoothly increment angle for continuous rotation
-        open_loop_angle += 8;  // Small increment every loop = smooth rotation
-        if (open_loop_angle >= 32768) open_loop_angle -= 32768;
-        angle_to_use = open_loop_angle;
-      }
-      else
-      {
-        // Closed-loop: use encoder
-        angle_to_use = encoder_angle_raw;
-      }
-      
-      // Apply commutation
-      if (angle_to_use != 0 || open_loop_test)
-      {
-        Motor_Commutate(angle_to_use, duty_value);
-      }
-    }
-    else if (!motor_enabled)
-    {
-      // Motor disabled - all phases floating (50%)
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_period/2);
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_period/2);
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pwm_period/2);
-    }
-
     /* Calculate velocity every 50ms */
     if ((now - last_encoder_ms) >= 50U)
     {
@@ -695,32 +350,44 @@ int main(void)
     if ((now - last_print_ms) >= 200U)
     {
       last_print_ms = now;
-      uint32_t raw_pa0 = ReadAdcCounts(&hadc1, ADC_CHANNEL_1);
-      uint32_t raw_pa6 = ReadAdcCounts(&hadc2, ADC_CHANNEL_3);
-      uint32_t raw_pa7 = ReadAdcCounts(&hadc2, ADC_CHANNEL_4);
-      uint32_t raw_opamp = ReadAdcCounts(&hadc1, OPAMP_ADC_CHANNEL);
+      uint32_t raw = adc_dual_raw;
+      uint16_t raw_ia = (uint16_t)(raw & 0xFFFF);
+      uint16_t raw_ib = (uint16_t)(raw >> 16);
+      uint32_t raw_opamp = ReadAdcInjectedCounts(&hadc1);
 
-      uint32_t mv_pa0 = AdcCountsToMv(raw_pa0);
-      uint32_t mv_pa6 = AdcCountsToMv(raw_pa6);
-      uint32_t mv_pa7 = AdcCountsToMv(raw_pa7);
+      uint32_t mv_ia = AdcCountsToMv(raw_ia);
+      uint32_t mv_ib = AdcCountsToMv(raw_ib);
+      int32_t ia_ma = ((int32_t)mv_ia - (int32_t)ia_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
+      int32_t ib_ma = ((int32_t)mv_ib - (int32_t)ib_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
+      int32_t ic_ma = -(ia_ma + ib_ma);
+      int32_t mv_ic = (int32_t)ic_zero_mv + (ic_ma * CURRENT_SENSE_MV_PER_A) / 1000;
+      if (mv_ic < 0) mv_ic = 0;
+      if (mv_ic > (int32_t)ADC_VREF_MV) mv_ic = ADC_VREF_MV;
+
       uint32_t mv_opamp = AdcCountsToMv(raw_opamp);
       uint32_t mv_bus = mv_opamp * 21U;
 
-      UpdateMovingAverage(mv_pa0, mv_pa6, mv_pa7, mv_bus);
+      float mech_angle_rad = ((float)encoder_angle_raw * TWO_PI_F) / ENCODER_COUNTS_PER_REV;
+      float elec_angle_rad = mech_angle_rad * (float)FOC_POLE_PAIRS;
+      FOC_SensorData foc_data = {
+        .ia = (float)ia_ma * 0.001f,
+        .ib = (float)ib_ma * 0.001f,
+        .ic = (float)ic_ma * 0.001f,
+        .bus_v = (float)mv_bus * 0.001f,
+        .electrical_angle = elec_angle_rad
+      };
+      FOC_UpdateSensors(&foc_data);
 
-      if (avg_count > 0U)
+      UpdateMovingAverage(mv_ia, mv_ib, (uint32_t)mv_ic, mv_bus);
+
+      if (filt_ready)
       {
-        uint32_t avg_ia_mv = ia_mv_sum / avg_count;
-        uint32_t avg_ib_mv = ib_mv_sum / avg_count;
-        uint32_t avg_ic_mv = ic_mv_sum / avg_count;
-        uint32_t avg_bus_mv = bus_mv_sum / avg_count;
+        int32_t ia_ma_avg = ((int32_t)ia_mv_f - (int32_t)ia_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
+        int32_t ib_ma_avg = ((int32_t)ib_mv_f - (int32_t)ib_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
+        int32_t ic_ma_avg = ((int32_t)ic_mv_f - (int32_t)ic_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
 
-        int32_t ia_ma = ((int32_t)avg_ia_mv - (int32_t)ia_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
-        int32_t ib_ma = ((int32_t)avg_ib_mv - (int32_t)ib_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
-        int32_t ic_ma = ((int32_t)avg_ic_mv - (int32_t)ic_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
-
-        uint32_t bus_v = avg_bus_mv / 1000U;
-        uint32_t bus_mv_rem = avg_bus_mv % 1000U;
+        uint32_t bus_v = (uint32_t)bus_mv_f / 1000U;
+        uint32_t bus_mv_rem = (uint32_t)bus_mv_f % 1000U;
 
         // Convert floats to integers for printf
         int32_t deg_int = (int32_t)encoder_angle_deg;
@@ -729,22 +396,9 @@ int main(void)
         int32_t speed_frac = (int32_t)((encoder_speed - (float)speed_int) * 100.0f);
         if (speed_frac < 0) speed_frac = -speed_frac;
 
-        if (open_loop_test)
-        {
-          printf("OPEN-LOOP Motor:%s Duty:%2lu%% SimAngle:%5u | Iu:%5ldmA Iv:%5ldmA Iw:%5ldmA Bus:%3lu.%03luV\r\n",
-                 motor_enabled ? "ON " : "OFF",
-                 motor_duty_percent,
-                 open_loop_angle,
-                 ia_ma, ib_ma, ic_ma, bus_v, bus_mv_rem);
-        }
-        else
-        {
-          printf("Motor:%s Dir:%s Duty:%2lu%% | Ang:%5u(%ld.%1lddeg) Spd:%ld.%02ldrad/s | Iu:%5ldmA Iv:%5ldmA Iw:%5ldmA Bus:%3lu.%03luV\r\n",
-                 motor_enabled ? "ON " : "OFF", motor_direction > 0 ? "FWD" : "REV",
-                 motor_duty_percent,
-                 encoder_angle_raw, deg_int, deg_frac, speed_int, speed_frac,
-                 ia_ma, ib_ma, ic_ma, bus_v, bus_mv_rem);
-        }
+         printf("Ang:%5u(%ld.%1lddeg) Spd:%ld.%02ldrad/s | Iu:%5ldmA Iv:%5ldmA Iw:%5ldmA Bus:%3lu.%03luV\r\n",
+           encoder_angle_raw, deg_int, deg_frac, speed_int, speed_frac,
+           ia_ma_avg, ib_ma_avg, ic_ma_avg, bus_v, bus_mv_rem);
       }
     }
   }

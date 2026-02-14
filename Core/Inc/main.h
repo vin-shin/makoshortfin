@@ -53,6 +53,8 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+void Filter_SetAlpha(float alpha);
+float Filter_GetAlpha(void);
 
 /* USER CODE END EFP */
 
