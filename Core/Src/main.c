@@ -104,12 +104,9 @@ volatile uint8_t foc_isr_enabled = 0;
 volatile uint32_t foc_isr_count = 0;
 volatile uint32_t foc_isr_max_cycles = 0;
 
-/* A1333 Encoder Variables (main loop only) */
+/* A1333 Encoder */
 static A1333_Handle angle_sensor;
-static uint16_t encoder_angle_raw = 0;
-static float encoder_angle_deg = 0.0f;
-static float encoder_angle_rad = 0.0f;
-static float encoder_offset_rad = 0.0f;
+float encoder_offset_rad = 0.0f;  /* Non-static: ISR reads this */
 
 /* Non-blocking UART telemetry */
 static char uart_tx_buf[UART_TX_BUF_SIZE];
@@ -340,7 +337,9 @@ int main(void)
       A1333_IsAngleValid(&angle_sensor, &valid);
       HAL_Delay(10);
     }
-    A1333_ReadAngle15(&angle_sensor, &encoder_angle_raw, &encoder_angle_deg);
+    uint16_t init_raw;
+    float init_deg;
+    A1333_ReadAngle15(&angle_sensor, &init_raw, &init_deg);
   }
 
   /* Start OPAMP, calibrate ADCs */
@@ -423,24 +422,7 @@ int main(void)
     /* USER CODE BEGIN 3 */
     uint32_t now = HAL_GetTick();
 
-    /* --- Task 1: Encoder read (blocking SPI ~5us, OK in main loop) --- */
-    A1333_Status enc_status = A1333_ReadAngle15(&angle_sensor, &encoder_angle_raw, &encoder_angle_deg);
-    if (enc_status == A1333_OK)
-    {
-      encoder_angle_rad = encoder_angle_deg * (TWO_PI_F / 360.0f);
-
-      /* Calculate electrical angle with calibrated offset */
-      float elec = encoder_angle_rad * (float)FOC_POLE_PAIRS - encoder_offset_rad;
-      while (elec > TWO_PI_F) elec -= TWO_PI_F;
-      while (elec < 0.0f) elec += TWO_PI_F;
-
-      /* Atomic write to shared variable (disable IRQ for store coherence) */
-      __disable_irq();
-      shared_electrical_angle = elec;
-      __enable_irq();
-    }
-
-    /* --- Task 2: Non-blocking bus voltage state machine --- */
+    /* --- Task 1: Non-blocking bus voltage state machine --- */
     {
       static enum { BV_IDLE, BV_WAIT } bv_state = BV_IDLE;
       static uint32_t bv_last_ms = 0;
@@ -474,7 +456,7 @@ int main(void)
       }
     }
 
-    /* --- Task 3: Non-blocking telemetry every 20ms --- */
+    /* --- Task 2: Non-blocking telemetry every 20ms --- */
     if ((now - last_print_ms) >= 20U)
     {
       last_print_ms = now;
@@ -485,12 +467,11 @@ int main(void)
       float max_us = (float)max_cyc / 170.0f;  /* 170 MHz -> cycles to us */
 
       int32_t el_deg = (int32_t)(shared_electrical_angle * 57.2957795f);
-      int32_t enc_mech = (int32_t)encoder_angle_deg;
       int32_t bus_mv = (int32_t)(shared_bus_voltage * 1000.0f);
 
       int len = snprintf(uart_tx_buf, UART_TX_BUF_SIZE,
-             "θe:%3ld° θm:%3ld° Bus:%ld.%01ldV ISR:%luHz peak:%.1fus\r\n",
-             el_deg, enc_mech,
+             "θe:%3ld° Bus:%ld.%01ldV ISR:%luHz peak:%.1fus\r\n",
+             el_deg,
              bus_mv / 1000, (bus_mv % 1000) / 100,
              isr_cnt * 50UL,  /* counts per 20ms * 50 = counts/sec */
              max_us);
