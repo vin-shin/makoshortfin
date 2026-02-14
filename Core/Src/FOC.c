@@ -124,6 +124,12 @@ void FOC_Reset(void)
   s_iq_integrator = 0.0f;
 }
 
+void FOC_ResetIntegrators(void)
+{
+  s_id_integrator = 0.0f;
+  s_iq_integrator = 0.0f;
+}
+
 void FOC_SetPolePairs(uint16_t pole_pairs)
 {
   if (pole_pairs == 0)

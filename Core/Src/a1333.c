@@ -94,7 +94,7 @@ static A1333_Status spi_transfer_16(A1333_Handle *dev, uint16_t tx, uint16_t *rx
                                          (uint8_t *)&tx,
                                          (uint8_t *)&rx_buf,
                                          1,       /* 1 x 16-bit unit */
-                                         10);     /* 10 ms timeout */
+                                         2);      /* 2 ms timeout */
 
     cs_high(dev);
     cs_idle_delay();  /* tCS_IDLE >= 200 ns */

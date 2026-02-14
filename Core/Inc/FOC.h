@@ -29,6 +29,7 @@ typedef struct
 
 void FOC_Init(void);
 void FOC_Reset(void);
+void FOC_ResetIntegrators(void);
 void FOC_SetPolePairs(uint16_t pole_pairs);
 void FOC_SetCurrentOffsets(float ia_offset, float ib_offset, float ic_offset);
 void FOC_SetCurrentRefs(float id_ref, float iq_ref);

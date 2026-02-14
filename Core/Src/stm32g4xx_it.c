@@ -22,6 +22,8 @@
 #include "stm32g4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "FOC.h"
+#include "tim.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,7 +59,15 @@
 /* External variables --------------------------------------------------------*/
 
 /* USER CODE BEGIN EV */
-
+extern UART_HandleTypeDef huart1;
+extern volatile uint32_t adc_dual_raw;
+extern uint32_t ia_zero_mv;
+extern uint32_t ib_zero_mv;
+extern volatile float shared_electrical_angle;
+extern volatile float shared_bus_voltage;
+extern volatile uint8_t foc_isr_enabled;
+extern volatile uint32_t foc_isr_count;
+extern volatile uint32_t foc_isr_max_cycles;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -199,5 +209,66 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /* USER CODE BEGIN 1 */
+void USART1_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart1);
+}
 
+void TIM1_UP_TIM16_IRQHandler(void)
+{
+  /* Clear update interrupt flag immediately */
+  __HAL_TIM_CLEAR_IT(&htim1, TIM_IT_UPDATE);
+
+  if (!foc_isr_enabled)
+  {
+    /* Safe state: 50% duty (zero voltage) */
+    TIM1->CCR1 = 2833U;
+    TIM1->CCR2 = 2833U;
+    TIM1->CCR3 = 2833U;
+    return;
+  }
+
+  /* Start cycle counter for profiling */
+  uint32_t cyc_start = DWT->CYCCNT;
+
+  /* 1. Read phase currents from DMA buffer */
+  uint32_t raw = adc_dual_raw;
+  uint16_t raw_ia = (uint16_t)(raw & 0xFFFF);
+  uint16_t raw_ib = (uint16_t)(raw >> 16);
+
+  /* Convert ADC counts -> millivolts -> Amps (inlined for speed) */
+  float ia_mv = (float)(raw_ia * 3300U) / 4095.0f;
+  float ib_mv = (float)(raw_ib * 3300U) / 4095.0f;
+  float ia = (ia_mv - (float)ia_zero_mv) / 20.0f;  /* 20 mV/A sensitivity */
+  float ib = (ib_mv - (float)ib_zero_mv) / 20.0f;
+
+  /* 2. Read shared data (single aligned float reads are atomic on CM4) */
+  float elec_angle = shared_electrical_angle;
+  float bus_v = shared_bus_voltage;
+
+  /* 3. Run FOC */
+  FOC_SensorData sensors;
+  sensors.ia = ia;
+  sensors.ib = ib;
+  sensors.ic = -(ia + ib);
+  sensors.bus_v = bus_v;
+  sensors.electrical_angle = elec_angle;
+
+  FOC_Output output;
+  FOC_UpdateSensors(&sensors);
+  FOC_Run(&output);
+
+  /* 4. Apply PWM via direct register writes (no HAL overhead) */
+  TIM1->CCR1 = (uint32_t)(output.duty_u * 5666.0f);
+  TIM1->CCR2 = (uint32_t)(output.duty_v * 5666.0f);
+  TIM1->CCR3 = (uint32_t)(output.duty_w * 5666.0f);
+
+  /* 5. Profiling */
+  uint32_t cyc_elapsed = DWT->CYCCNT - cyc_start;
+  foc_isr_count++;
+  if (cyc_elapsed > foc_isr_max_cycles)
+  {
+    foc_isr_max_cycles = cyc_elapsed;
+  }
+}
 /* USER CODE END 1 */

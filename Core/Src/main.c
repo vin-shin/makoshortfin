@@ -65,15 +65,17 @@
 /* FOC control parameters */
 #define FOC_IQ_REF_A      2.0f       /* Target q-axis current (torque) in Amps */
 #define FOC_ID_REF_A      0.0f       /* Target d-axis current (flux weakening) */
-#define FOC_KP_D          0.5f       /* D-axis PI controller Kp */
+#define FOC_KP_D          0.1f       /* D-axis PI controller Kp (tuned for 15kHz) */
 #define FOC_KI_D          50.0f      /* D-axis PI controller Ki */
-#define FOC_KP_Q          0.5f       /* Q-axis PI controller Kp */
+#define FOC_KP_Q          0.1f       /* Q-axis PI controller Kp (tuned for 15kHz) */
 #define FOC_KI_Q          50.0f      /* Q-axis PI controller Ki */
 #define TIM1_PERIOD       5666U      /* TIM1 ARR value (30 kHz PWM) */
-#define FOC_LOOP_PERIOD_MS 2U        /* FOC control loop period in ms */
-#define FOC_DT_SECONDS    0.002f     /* Control period in seconds (2ms) */
+#define FOC_ISR_FREQ_HZ   15000U     /* FOC ISR rate (TIM1 30kHz / RCR+1) */
+#define FOC_ISR_DT_SECONDS (1.0f / (float)FOC_ISR_FREQ_HZ)
 #define FOC_ALIGN_TIME_MS 500U       /* Rotor alignment time in ms */
 #define FOC_ALIGN_VOLTAGE 1.5f       /* Alignment voltage */
+#define BUS_V_UPDATE_MS   100U       /* Bus voltage re-read interval */
+#define UART_TX_BUF_SIZE  256U       /* Non-blocking UART transmit buffer */
 
 PUTCHAR_PROTOTYPE
 {
@@ -90,24 +92,28 @@ PUTCHAR_PROTOTYPE
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-static uint32_t ia_zero_mv = CURRENT_ZERO_MV;
-static uint32_t ib_zero_mv = CURRENT_ZERO_MV;
+/* ISR-visible variables (non-static, accessed by TIM1 Update ISR) */
+uint32_t ia_zero_mv = CURRENT_ZERO_MV;
+uint32_t ib_zero_mv = CURRENT_ZERO_MV;
+volatile uint32_t adc_dual_raw = 0;
 
+/* Shared ISR <-> main loop state */
+volatile float shared_electrical_angle = 0.0f;
+volatile float shared_bus_voltage = 0.0f;
+volatile uint8_t foc_isr_enabled = 0;
+volatile uint32_t foc_isr_count = 0;
+volatile uint32_t foc_isr_max_cycles = 0;
 
-static volatile uint32_t adc_dual_raw = 0;
-
-/* A1333 Encoder Variables */
+/* A1333 Encoder Variables (main loop only) */
 static A1333_Handle angle_sensor;
 static uint16_t encoder_angle_raw = 0;
 static float encoder_angle_deg = 0.0f;
 static float encoder_angle_rad = 0.0f;
-static int16_t encoder_angle_prev = 0;
-static uint32_t encoder_last_time = 0;
+static float encoder_offset_rad = 0.0f;
 
-/* FOC state */
-static float electrical_angle_rad = 0.0f;
-static FOC_SensorData foc_sensors;
-static FOC_Output foc_output;
+/* Non-blocking UART telemetry */
+static char uart_tx_buf[UART_TX_BUF_SIZE];
+static volatile uint8_t uart_tx_busy = 0;
 
 /* USER CODE END PV */
 
@@ -178,10 +184,82 @@ __attribute__((unused)) static void DisablePwmOutputs(void)
   HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_3);
 }
 
-static float CurrentMvToAmps(int32_t mv_offset)
+static float ReadBusVoltageBlocking(void)
 {
-  /* Convert millivolt offset from zero to Amperes */
-  return ((float)mv_offset / 1000.0f) / ((float)CURRENT_SENSE_MV_PER_A / 1000.0f);
+  uint32_t raw = ReadAdcInjectedCounts(&hadc1);
+  uint32_t mv = AdcCountsToMv(raw);
+  return ((float)mv / 1000.0f) * BUS_VOLTAGE_DIVIDER_RATIO;
+}
+
+static void AlignRotorSVPWM(float vd, float vq, float elec_angle, float bus_v)
+{
+  float sin_t, cos_t;
+  FOC_SinCos(elec_angle, &sin_t, &cos_t);
+
+  float v_alpha = vd * cos_t - vq * sin_t;
+  float v_beta  = vd * sin_t + vq * cos_t;
+
+  float v_u = v_alpha;
+  float v_v = -0.5f * v_alpha + 0.866025404f * v_beta;
+  float v_w = -0.5f * v_alpha - 0.866025404f * v_beta;
+
+  float v_max = v_u > v_v ? v_u : v_v; if (v_w > v_max) v_max = v_w;
+  float v_min = v_u < v_v ? v_u : v_v; if (v_w < v_min) v_min = v_w;
+  float v_offset = 0.5f * (v_max + v_min);
+  v_u -= v_offset;
+  v_v -= v_offset;
+  v_w -= v_offset;
+
+  float inv_bus = 1.0f / bus_v;
+  SetPwmDuties(0.5f + v_u * inv_bus, 0.5f + v_v * inv_bus, 0.5f + v_w * inv_bus);
+}
+
+static float CalibrateEncoderOffset(float bus_v)
+{
+  /* Phase 1: Apply current at electrical angle 0 to lock rotor */
+  printf("Aligning rotor to electrical zero...\r\n");
+  AlignRotorSVPWM(0.0f, FOC_ALIGN_VOLTAGE, 0.0f, bus_v);
+  HAL_Delay(FOC_ALIGN_TIME_MS);
+
+  /* Phase 2: Read encoder angle at the locked position */
+  float sum_deg = 0.0f;
+  uint16_t raw;
+  float deg;
+  for (int i = 0; i < 16; i++)
+  {
+    A1333_ReadAngle15(&angle_sensor, &raw, &deg);
+    sum_deg += deg;
+    HAL_Delay(5);
+  }
+  float mech_at_zero_deg = sum_deg / 16.0f;
+  float mech_at_zero_rad = mech_at_zero_deg * (TWO_PI_F / 360.0f);
+
+  /* The electrical angle at alignment is 0, so:
+     electrical_angle = (mechanical * pole_pairs) - offset = 0
+     offset = mechanical * pole_pairs (wrapped to [0, 2*pi]) */
+  float offset = mech_at_zero_rad * (float)FOC_POLE_PAIRS;
+  while (offset > TWO_PI_F) offset -= TWO_PI_F;
+  while (offset < 0.0f) offset += TWO_PI_F;
+
+  printf("Encoder offset: mech=%.1f deg  offset=%.3f rad\r\n", mech_at_zero_deg, offset);
+
+  /* Ramp down alignment voltage */
+  for (int i = 10; i >= 0; i--)
+  {
+    float v = FOC_ALIGN_VOLTAGE * ((float)i / 10.0f);
+    AlignRotorSVPWM(0.0f, v, 0.0f, bus_v);
+    HAL_Delay(20);
+  }
+  SetPwmDuties(0.5f, 0.5f, 0.5f);
+
+  return offset;
+}
+
+static void UART_SendNonBlocking(const char *buf, uint16_t len)
+{
+  if (uart_tx_busy) return;  /* Drop if previous transfer not done */
+  uart_tx_busy = 1;
+  HAL_UART_Transmit_IT(&huart1, (uint8_t *)buf, len);
 }
 
 /* USER CODE END 0 */
@@ -225,18 +303,22 @@ int main(void)
   MX_OPAMP3_Init();
   /* USER CODE BEGIN 2 */
 
+  /* Configure NVIC priorities */
+  HAL_NVIC_SetPriority(USART1_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
+
   /* Enable UCC27302A gate driver (PC7, PC8, PC9) */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_SET);
 
   UART_Send("Hello, Mako Shortfin!\n");
   printf("Clock: %lu Hz\r\n", SystemCoreClock);
-  printf("=== Closed-Loop FOC Control ===\r\n");
+  printf("=== ISR-Based FOC Control @ %u Hz ===\r\n", FOC_ISR_FREQ_HZ);
   printf("Iq_ref=%.1fA  Id_ref=%.1fA  Poles=%u\r\n", FOC_IQ_REF_A, FOC_ID_REF_A, FOC_POLE_PAIRS);
   printf("Current PI: Kp=%.2f Ki=%.1f\r\n", FOC_KP_Q, FOC_KI_Q);
 
   FOC_Init();
   FOC_SetPolePairs(FOC_POLE_PAIRS);
-  FOC_SetControlPeriod(FOC_DT_SECONDS);
+  FOC_SetControlPeriod(FOC_ISR_DT_SECONDS);
   FOC_SetCurrentGains(FOC_KP_D, FOC_KI_D, FOC_KP_Q, FOC_KI_Q);
   FOC_SetCurrentRefs(FOC_ID_REF_A, FOC_IQ_REF_A);
 
@@ -259,8 +341,6 @@ int main(void)
       HAL_Delay(10);
     }
     A1333_ReadAngle15(&angle_sensor, &encoder_angle_raw, &encoder_angle_deg);
-    encoder_angle_prev = (int16_t)encoder_angle_raw;
-    encoder_last_time = HAL_GetTick();
   }
 
   /* Start OPAMP, calibrate ADCs */
@@ -269,7 +349,7 @@ int main(void)
   if (HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED) != HAL_OK) Error_Handler();
 
   /* Start dual-mode ADC DMA with timer trigger */
-  HAL_Delay(1);  /* Wait for ADC voltage regulator stabilization */
+  HAL_Delay(1);
   if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)&adc_dual_raw, 1) != HAL_OK) {
     printf("ERROR: ADC DMA start failed!\r\n");
     Error_Handler();
@@ -282,7 +362,7 @@ int main(void)
   if (HAL_TIM_Base_Start(&htim1) != HAL_OK) Error_Handler();
   if (HAL_TIM_OC_Start(&htim1, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
 
-  /* Disable DMA interrupts (polling mode) */
+  /* Disable DMA interrupts (polling mode for ADC data) */
   if (hadc1.DMA_Handle != NULL) {
     __HAL_DMA_DISABLE_IT(hadc1.DMA_Handle, DMA_IT_TC | DMA_IT_HT | DMA_IT_TE);
   }
@@ -293,20 +373,13 @@ int main(void)
   uint16_t ib_raw = (uint16_t)(adc_dual_raw >> 16);
   ia_zero_mv = AdcCountsToMv(ia_raw);
   ib_zero_mv = AdcCountsToMv(ib_raw);
-
   printf("ADC zeroed: Ia=%lu mV, Ib=%lu mV\r\n", ia_zero_mv, ib_zero_mv);
 
-  /* Set FOC current offsets */
-  FOC_SetCurrentOffsets(
-    CurrentMvToAmps((int32_t)ia_zero_mv - CURRENT_ZERO_MV),
-    CurrentMvToAmps((int32_t)ib_zero_mv - CURRENT_ZERO_MV),
-    0.0f  /* Ic is calculated from Ia + Ib */
-  );
+  /* ISR handles current offset subtraction inline, no need for FOC_SetCurrentOffsets */
 
-  /* Read bus voltage for SVPWM scaling */
-  uint32_t raw_opamp = ReadAdcInjectedCounts(&hadc1);
-  uint32_t mv_opamp = AdcCountsToMv(raw_opamp);
-  float bus_v = ((float)mv_opamp / 1000.0f) * BUS_VOLTAGE_DIVIDER_RATIO;
+  /* Read bus voltage (blocking OK during init, before ISR starts) */
+  float bus_v = ReadBusVoltageBlocking();
+  shared_bus_voltage = bus_v;
   printf("Bus: %ld.%01ld V\r\n",
          (int32_t)bus_v, (int32_t)((bus_v - (int32_t)bus_v) * 10.0f));
 
@@ -315,7 +388,28 @@ int main(void)
   EnablePwmOutputs();
   __HAL_TIM_MOE_ENABLE(&htim1);
 
-  printf("FOC control started.\r\n\r\n");
+  /* Calibrate encoder offset by aligning rotor to electrical zero */
+  encoder_offset_rad = CalibrateEncoderOffset(bus_v);
+
+  /* Reset PI integrators after alignment (keeps all config intact) */
+  FOC_ResetIntegrators();
+
+  /* Enable DWT cycle counter for ISR profiling */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+  /* Set initial shared state */
+  shared_electrical_angle = 0.0f;
+
+  /* Enable TIM1 Update interrupt (FOC ISR at 15 kHz) */
+  HAL_NVIC_SetPriority(TIM1_UP_TIM16_IRQn, 0, 0);  /* Highest priority */
+  HAL_NVIC_EnableIRQ(TIM1_UP_TIM16_IRQn);
+  __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+
+  /* Start FOC processing in ISR */
+  foc_isr_enabled = 1;
+  printf("FOC ISR started @ %u Hz\r\n\r\n", FOC_ISR_FREQ_HZ);
 
   uint32_t last_print_ms = HAL_GetTick();
 
@@ -327,69 +421,83 @@ int main(void)
   {
     /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
-    uint32_t loop_start = HAL_GetTick();
+    uint32_t now = HAL_GetTick();
 
-    /* Read encoder angle (mechanical) */
-    A1333_ReadAngle15(&angle_sensor, &encoder_angle_raw, &encoder_angle_deg);
-    encoder_angle_rad = encoder_angle_deg * (TWO_PI_F / 360.0f);
-
-    /* Calculate electrical angle from mechanical angle */
-    electrical_angle_rad = encoder_angle_rad * (float)FOC_POLE_PAIRS;
-    while (electrical_angle_rad > TWO_PI_F) electrical_angle_rad -= TWO_PI_F;
-    while (electrical_angle_rad < 0.0f) electrical_angle_rad += TWO_PI_F;
-
-    /* Read phase currents from DMA buffer */
-    uint32_t raw = adc_dual_raw;
-    uint16_t raw_ia = (uint16_t)(raw & 0xFFFF);
-    uint16_t raw_ib = (uint16_t)(raw >> 16);
-    uint32_t mv_ia = AdcCountsToMv(raw_ia);
-    uint32_t mv_ib = AdcCountsToMv(raw_ib);
-
-    /* Convert to Amperes */
-    foc_sensors.ia = CurrentMvToAmps((int32_t)mv_ia - (int32_t)ia_zero_mv);
-    foc_sensors.ib = CurrentMvToAmps((int32_t)mv_ib - (int32_t)ib_zero_mv);
-    foc_sensors.ic = -(foc_sensors.ia + foc_sensors.ib);
-    foc_sensors.bus_v = bus_v;
-    foc_sensors.electrical_angle = electrical_angle_rad;
-
-    /* Update FOC with sensor data */
-    FOC_UpdateSensors(&foc_sensors);
-
-    /* Run FOC control loop */
-    FOC_Run(&foc_output);
-
-    /* Apply PWM duty cycles */
-    SetPwmDuties(foc_output.duty_u, foc_output.duty_v, foc_output.duty_w);
-
-    /* Telemetry every 20ms */
-    if ((loop_start - last_print_ms) >= 20U)
+    /* --- Task 1: Encoder read (blocking SPI ~5us, OK in main loop) --- */
+    A1333_Status enc_status = A1333_ReadAngle15(&angle_sensor, &encoder_angle_raw, &encoder_angle_deg);
+    if (enc_status == A1333_OK)
     {
-      last_print_ms = loop_start;
+      encoder_angle_rad = encoder_angle_deg * (TWO_PI_F / 360.0f);
 
-      int32_t ia_ma = (int32_t)(foc_sensors.ia * 1000.0f);
-      int32_t ib_ma = (int32_t)(foc_sensors.ib * 1000.0f);
-      int32_t ic_ma = (int32_t)(foc_sensors.ic * 1000.0f);
+      /* Calculate electrical angle with calibrated offset */
+      float elec = encoder_angle_rad * (float)FOC_POLE_PAIRS - encoder_offset_rad;
+      while (elec > TWO_PI_F) elec -= TWO_PI_F;
+      while (elec < 0.0f) elec += TWO_PI_F;
 
-      int32_t id_ma = (int32_t)(foc_output.id_ref * 1000.0f);
-      int32_t iq_ma = (int32_t)(foc_output.iq_ref * 1000.0f);
-
-      int32_t vd_mv = (int32_t)(foc_output.vd * 1000.0f);
-      int32_t vq_mv = (int32_t)(foc_output.vq * 1000.0f);
-
-      int32_t el_deg = (int32_t)(electrical_angle_rad * 57.2957795f);
-      int32_t enc_mech = (int32_t)encoder_angle_deg;
-
-      int32_t du_pct = (int32_t)(foc_output.duty_u * 100.0f);
-      int32_t dv_pct = (int32_t)(foc_output.duty_v * 100.0f);
-      int32_t dw_pct = (int32_t)(foc_output.duty_w * 100.0f);
-
-      printf("θe:%3ld° θm:%3ld° | Ia:%5ldmA Ib:%5ldmA Ic:%5ldmA | Vd:%4ldmV Vq:%4ldmV | D:%ld/%ld/%ld%%\r\n",
-             el_deg, enc_mech, ia_ma, ib_ma, ic_ma, vd_mv, vq_mv, du_pct, dv_pct, dw_pct);
+      /* Atomic write to shared variable (disable IRQ for store coherence) */
+      __disable_irq();
+      shared_electrical_angle = elec;
+      __enable_irq();
     }
 
-    /* Fixed loop timing: wait until period elapsed */
-    while ((HAL_GetTick() - loop_start) < FOC_LOOP_PERIOD_MS) {
-      /* Busy wait for consistent timing */
+    /* --- Task 2: Non-blocking bus voltage state machine --- */
+    {
+      static enum { BV_IDLE, BV_WAIT } bv_state = BV_IDLE;
+      static uint32_t bv_last_ms = 0;
+
+      if (bv_state == BV_IDLE && (now - bv_last_ms) >= BUS_V_UPDATE_MS)
+      {
+        /* Only start injected when TIM1 counter is far from ADC trigger (CH4=2833) */
+        uint32_t cnt = __HAL_TIM_GET_COUNTER(&htim1);
+        if (cnt < 1000U || cnt > 4500U)
+        {
+          HAL_ADCEx_InjectedStart(&hadc1);
+          bv_state = BV_WAIT;
+        }
+      }
+      if (bv_state == BV_WAIT)
+      {
+        if (__HAL_ADC_GET_FLAG(&hadc1, ADC_FLAG_JEOS))
+        {
+          uint32_t raw = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1);
+          HAL_ADCEx_InjectedStop(&hadc1);
+          __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_JEOS | ADC_FLAG_JEOC);
+
+          float v = ((float)AdcCountsToMv(raw) / 1000.0f) * BUS_VOLTAGE_DIVIDER_RATIO;
+          __disable_irq();
+          shared_bus_voltage = v;
+          __enable_irq();
+
+          bv_state = BV_IDLE;
+          bv_last_ms = now;
+        }
+      }
+    }
+
+    /* --- Task 3: Non-blocking telemetry every 20ms --- */
+    if ((now - last_print_ms) >= 20U)
+    {
+      last_print_ms = now;
+
+      /* Read ISR profiling data */
+      uint32_t isr_cnt = foc_isr_count;
+      uint32_t max_cyc = foc_isr_max_cycles;
+      float max_us = (float)max_cyc / 170.0f;  /* 170 MHz -> cycles to us */
+
+      int32_t el_deg = (int32_t)(shared_electrical_angle * 57.2957795f);
+      int32_t enc_mech = (int32_t)encoder_angle_deg;
+      int32_t bus_mv = (int32_t)(shared_bus_voltage * 1000.0f);
+
+      int len = snprintf(uart_tx_buf, UART_TX_BUF_SIZE,
+             "θe:%3ld° θm:%3ld° Bus:%ld.%01ldV ISR:%luHz peak:%.1fus\r\n",
+             el_deg, enc_mech,
+             bus_mv / 1000, (bus_mv % 1000) / 100,
+             isr_cnt * 50UL,  /* counts per 20ms * 50 = counts/sec */
+             max_us);
+      if (len > 0) UART_SendNonBlocking(uart_tx_buf, (uint16_t)len);
+
+      foc_isr_count = 0;       /* Reset count for next telemetry period */
+      foc_isr_max_cycles = 0;  /* Reset peak tracker */
     }
   }
   /* USER CODE END 3 */
@@ -442,7 +550,13 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    uart_tx_busy = 0;
+  }
+}
 /* USER CODE END 4 */
 
 /**
