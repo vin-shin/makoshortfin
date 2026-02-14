@@ -63,13 +63,13 @@
 #define A1333_CS_PIN GPIO_PIN_15
 
 /* Open-loop test parameters */
-#define OL_VQ             2.0f       /* Voltage magnitude in volts (q-axis) */
+#define OL_VQ             0.5f       /* Voltage magnitude in volts (q-axis) */
 #define OL_VD             0.0f       /* d-axis voltage (keep 0 for torque-producing) */
-#define OL_SPEED_RAD_S    150.0f      /* Electrical rad/s for open-loop sweep */
-#define OL_ALIGN_TIME_MS  1000U      /* Rotor alignment hold time in ms */
-#define OL_ALIGN_VOLTAGE  2.0f       /* Voltage during alignment phase */
+#define OL_SPEED_RAD_S    200.0f      /* Electrical rad/s for open-loop sweep */
+#define OL_ALIGN_TIME_MS  500U      /* Rotor alignment hold time in ms */
+#define OL_ALIGN_VOLTAGE  1.5f       /* Voltage during alignment phase */
 #define TIM1_PERIOD       5666U      /* TIM1 ARR value (30 kHz PWM) */
-#define OL_LOOP_PERIOD_MS 5U         /* Fixed loop period for consistent timing */
+#define OL_LOOP_PERIOD_MS 2U         /* Fixed loop period for consistent timing */
 
 PUTCHAR_PROTOTYPE
 {
@@ -278,108 +278,45 @@ int main(void)
   if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK) Error_Handler();
   if (HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED) != HAL_OK) Error_Handler();
 
-  /* Wait for ADC voltage regulator to stabilize after calibration (20us typical) */
-  printf("Waiting for ADC voltage regulator stabilization...\r\n");
-  HAL_Delay(1);
-
   /* Start dual-mode ADC DMA with timer trigger */
-  printf("Starting dual-mode ADC DMA...\r\n");
+  HAL_Delay(1);  /* Wait for ADC voltage regulator stabilization */
   if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)&adc_dual_raw, 1) != HAL_OK) {
-    printf("ERROR: MultiMode DMA start failed!\r\n");
+    printf("ERROR: ADC DMA start failed!\r\n");
     Error_Handler();
   }
 
-  /* CRITICAL FIX: HAL doesn't set DMAEN bit - set it manually! */
+  /* CRITICAL: HAL doesn't set DMAEN bit - set it manually */
   SET_BIT(hadc1.Instance->CFGR, ADC_CFGR_DMAEN);
-  printf("ADC DMA configured (DMAEN bit manually set).\r\n");
 
-  /* Start TIM1 base + CH4 (ADC trigger) - AFTER ADCs are ready */
-  printf("Starting TIM1 for PWM and ADC trigger...\r\n");
+  /* Start TIM1 base + CH4 (ADC trigger) */
   if (HAL_TIM_Base_Start(&htim1) != HAL_OK) Error_Handler();
   if (HAL_TIM_OC_Start(&htim1, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
-  printf("TIM1 started (TRGO2 now triggering ADCs)\r\n");
 
-  /* Verify TIM1 CH4 configuration */
-  uint32_t ccr4_value = __HAL_TIM_GET_COMPARE(&htim1, TIM_CHANNEL_4);
-  printf("TIM1: ARR=%lu, CCR4=%lu (should be ~%u)\r\n",
-         htim1.Instance->ARR, ccr4_value, TIM1_PERIOD/2);
-
-  /* Disable DMA interrupts (we'll just poll the data) */
+  /* Disable DMA interrupts (polling mode) */
   if (hadc1.DMA_Handle != NULL) {
     __HAL_DMA_DISABLE_IT(hadc1.DMA_Handle, DMA_IT_TC | DMA_IT_HT | DMA_IT_TE);
   }
 
-  /* Verify DMA configuration */
-  if (hadc1.DMA_Handle != NULL) {
-    printf("DMA1_Ch1: EN=%lu, CNDTR=%lu\r\n",
-           (hadc1.DMA_Handle->Instance->CCR & DMA_CCR_EN) ? 1UL : 0UL,
-           hadc1.DMA_Handle->Instance->CNDTR);
-    printf("DMA CPAR=0x%08lX (peripheral addr)\r\n", hadc1.DMA_Handle->Instance->CPAR);
-    printf("DMA CMAR=0x%08lX (memory addr, should be 0x%08lX)\r\n",
-           hadc1.DMA_Handle->Instance->CMAR, (uint32_t)&adc_dual_raw);
-    printf("ADC_COMMON CDR addr=0x%08lX\r\n", (uint32_t)&(ADC12_COMMON->CDR));
-    printf("ADC1 CFGR=0x%08lX (DMAEN bit should be set)\r\n", hadc1.Instance->CFGR);
-  } else {
-    printf("ERROR: ADC1 DMA handle is NULL!\r\n");
-  }
-
-  printf("Waiting for ADC triggers...\r\n");
+  /* Zero the current sensors */
   HAL_Delay(100);
+  uint16_t ia_raw = (uint16_t)(adc_dual_raw & 0xFFFF);
+  uint16_t ib_raw = (uint16_t)(adc_dual_raw >> 16);
+  ia_zero_mv = AdcCountsToMv(ia_raw);
+  ib_zero_mv = AdcCountsToMv(ib_raw);
 
-  /* Check if DMA is being updated by timer */
-  uint32_t test1 = adc_dual_raw;
-  HAL_Delay(10);
-  uint32_t test2 = adc_dual_raw;
-  HAL_Delay(10);
-  uint32_t test3 = adc_dual_raw;
+  printf("ADC zeroed: Ia=%lu mV, Ib=%lu mV\r\n", ia_zero_mv, ib_zero_mv);
 
-  printf("DMA test: #1=0x%08lX  #2=0x%08lX  #3=0x%08lX\r\n", test1, test2, test3);
-
-  /* Check ADC status flags */
-  uint32_t adc1_isr = hadc1.Instance->ISR;
-  uint32_t adc2_isr = hadc2.Instance->ISR;
-  printf("ADC1 ISR=0x%08lX (RDY=%lu EOC=%lu)\r\n", adc1_isr,
-         (adc1_isr & ADC_ISR_ADRDY) ? 1UL : 0UL,
-         (adc1_isr & ADC_ISR_EOC) ? 1UL : 0UL);
-  printf("ADC2 ISR=0x%08lX (RDY=%lu EOC=%lu)\r\n", adc2_isr,
-         (adc2_isr & ADC_ISR_ADRDY) ? 1UL : 0UL,
-         (adc2_isr & ADC_ISR_EOC) ? 1UL : 0UL);
-
-  if (test1 == 0 && test2 == 0 && test3 == 0) {
-    printf("ERROR: ADC DMA still not updating!\r\n");
-    printf("Continuing anyway - motor will spin but no current sense\r\n");
-    ia_zero_mv = CURRENT_ZERO_MV;
-    ib_zero_mv = CURRENT_ZERO_MV;
-  } else if (test1 == test2 && test2 == test3) {
-    printf("WARNING: ADC values not changing (stuck at 0x%08lX)\r\n", test1);
-    uint16_t ia_raw = (uint16_t)(test1 & 0xFFFF);
-    uint16_t ib_raw = (uint16_t)(test1 >> 16);
-    ia_zero_mv = AdcCountsToMv(ia_raw);
-    ib_zero_mv = AdcCountsToMv(ib_raw);
-  } else {
-    /* DMA working! Zero the currents */
-    uint16_t ia_raw = (uint16_t)(adc_dual_raw & 0xFFFF);
-    uint16_t ib_raw = (uint16_t)(adc_dual_raw >> 16);
-    ia_zero_mv = AdcCountsToMv(ia_raw);
-    ib_zero_mv = AdcCountsToMv(ib_raw);
-    printf("SUCCESS: ADC DMA working! (values changing)\r\n");
-  }
-
-  printf("ADC zeroed: Ia=%lu mV  Ib=%lu mV\r\n", ia_zero_mv, ib_zero_mv);
-
-  /* ---- Phase 1: Alignment ---- */
-  printf("Aligning rotor to electrical angle 0...\r\n");
+  /* Alignment phase */
   SetPwmDuties(0.5f, 0.5f, 0.5f);
   EnablePwmOutputs();
-  __HAL_TIM_MOE_ENABLE(&htim1);  /* Enable main output for TIM1 */
+  __HAL_TIM_MOE_ENABLE(&htim1);
 
   /* Read bus voltage for SVPWM scaling */
   uint32_t raw_opamp = ReadAdcInjectedCounts(&hadc1);
   uint32_t mv_opamp = AdcCountsToMv(raw_opamp);
   float bus_v = ((float)mv_opamp / 1000.0f) * BUS_VOLTAGE_DIVIDER_RATIO;
-  printf("Bus voltage: %ld.%01ld V (ADC raw=%lu, mV=%lu, divider=%.2f)\r\n",
-         (int32_t)bus_v, (int32_t)((bus_v - (int32_t)bus_v) * 10.0f),
-         raw_opamp, mv_opamp, BUS_VOLTAGE_DIVIDER_RATIO);
+  printf("Bus: %ld.%01ld V | Aligning rotor...\r\n",
+         (int32_t)bus_v, (int32_t)((bus_v - (int32_t)bus_v) * 10.0f));
 
   {
     float du, dv, dw;
@@ -387,7 +324,7 @@ int main(void)
     SetPwmDuties(du, dv, dw);
   }
   HAL_Delay(OL_ALIGN_TIME_MS);
-  printf("Alignment done. Starting open-loop spin.\r\n");
+  printf("Open-loop spin started.\r\n\r\n");
 
   /* ---- Phase 2: Open-loop spin ---- */
   ol_electrical_angle = 0.0f;
@@ -418,8 +355,8 @@ int main(void)
     /* Read encoder (non-blocking) */
     A1333_ReadAngle15(&angle_sensor, &encoder_angle_raw, &encoder_angle_deg);
 
-    /* Telemetry every 200ms */
-    if ((loop_start - last_print_ms) >= 200U)
+    /* Telemetry every 5ms */
+    if ((loop_start - last_print_ms) >= 20U)
     {
       last_print_ms = loop_start;
 
@@ -434,14 +371,15 @@ int main(void)
       int32_t ic_ma = -(ia_ma + ib_ma);
 
       int32_t el_deg = (int32_t)(ol_electrical_angle * 57.2957795f);
-      int32_t enc_int = (int32_t)encoder_angle_deg;
+      int32_t enc_mech = (int32_t)encoder_angle_deg;
+      int32_t enc_elec = (enc_mech * (int32_t)FOC_POLE_PAIRS) % 360;
 
       int32_t du_pct = (int32_t)(du * 100.0f);
       int32_t dv_pct = (int32_t)(dv * 100.0f);
       int32_t dw_pct = (int32_t)(dw * 100.0f);
 
-      printf("eAng:%4ld  Enc:%4lddeg | Iu:%5ldmA(%4lumV) Iv:%5ldmA(%4lumV) Iw:%5ldmA | D:%ld/%ld/%ld%%\r\n",
-             el_deg, enc_int, ia_ma, mv_ia, ib_ma, mv_ib, ic_ma, du_pct, dv_pct, dw_pct);
+      printf("θe:%4ld° EncE:%4ld° Mech:%4ld° | Iu:%5ldmA Iv:%5ldmA Iw:%5ldmA | D:%ld/%ld/%ld%%\r\n",
+             el_deg, enc_elec, enc_mech, ia_ma, ib_ma, ic_ma, du_pct, dv_pct, dw_pct);
     }
 
     /* Fixed loop timing: wait until period elapsed */
