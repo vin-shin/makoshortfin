@@ -36,6 +36,7 @@ void FOC_SetCurrentGains(float kp_d, float ki_d, float kp_q, float ki_q);
 void FOC_SetControlPeriod(float dt_seconds);
 void FOC_UpdateSensors(const FOC_SensorData *data);
 void FOC_Run(FOC_Output *out);
+void FOC_SinCos(float angle, float *sin_out, float *cos_out);
 
 #ifdef __cplusplus
 }

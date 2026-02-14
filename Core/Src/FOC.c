@@ -96,6 +96,11 @@ static void FOC_CordicSinCos(float angle, float *sin_out, float *cos_out)
   }
 }
 
+void FOC_SinCos(float angle, float *sin_out, float *cos_out)
+{
+  FOC_CordicSinCos(angle, sin_out, cos_out);
+}
+
 void FOC_Init(void)
 {
   __HAL_RCC_CORDIC_CLK_ENABLE();
