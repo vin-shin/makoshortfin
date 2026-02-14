@@ -41,7 +41,7 @@ void MX_OPAMP3_Init(void)
   hopamp3.Init.PowerMode = OPAMP_POWERMODE_NORMALSPEED;
   hopamp3.Init.Mode = OPAMP_FOLLOWER_MODE;
   hopamp3.Init.NonInvertingInput = OPAMP_NONINVERTINGINPUT_IO0;
-  hopamp3.Init.InternalOutput = DISABLE;
+  hopamp3.Init.InternalOutput = ENABLE;  /* Enable internal routing to ADC */
   hopamp3.Init.TimerControlledMuxmode = OPAMP_TIMERCONTROLLEDMUXMODE_DISABLE;
   hopamp3.Init.UserTrimming = OPAMP_TRIMMING_FACTORY;
   if (HAL_OPAMP_Init(&hopamp3) != HAL_OK)
