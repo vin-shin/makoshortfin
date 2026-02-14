@@ -62,14 +62,18 @@
 #define A1333_CS_PORT GPIOA
 #define A1333_CS_PIN GPIO_PIN_15
 
-/* Open-loop test parameters */
-#define OL_VQ             0.5f       /* Voltage magnitude in volts (q-axis) */
-#define OL_VD             0.0f       /* d-axis voltage (keep 0 for torque-producing) */
-#define OL_SPEED_RAD_S    200.0f      /* Electrical rad/s for open-loop sweep */
-#define OL_ALIGN_TIME_MS  500U      /* Rotor alignment hold time in ms */
-#define OL_ALIGN_VOLTAGE  1.5f       /* Voltage during alignment phase */
+/* FOC control parameters */
+#define FOC_IQ_REF_A      2.0f       /* Target q-axis current (torque) in Amps */
+#define FOC_ID_REF_A      0.0f       /* Target d-axis current (flux weakening) */
+#define FOC_KP_D          0.5f       /* D-axis PI controller Kp */
+#define FOC_KI_D          50.0f      /* D-axis PI controller Ki */
+#define FOC_KP_Q          0.5f       /* Q-axis PI controller Kp */
+#define FOC_KI_Q          50.0f      /* Q-axis PI controller Ki */
 #define TIM1_PERIOD       5666U      /* TIM1 ARR value (30 kHz PWM) */
-#define OL_LOOP_PERIOD_MS 2U         /* Fixed loop period for consistent timing */
+#define FOC_LOOP_PERIOD_MS 2U        /* FOC control loop period in ms */
+#define FOC_DT_SECONDS    0.002f     /* Control period in seconds (2ms) */
+#define FOC_ALIGN_TIME_MS 500U       /* Rotor alignment time in ms */
+#define FOC_ALIGN_VOLTAGE 1.5f       /* Alignment voltage */
 
 PUTCHAR_PROTOTYPE
 {
@@ -96,12 +100,14 @@ static volatile uint32_t adc_dual_raw = 0;
 static A1333_Handle angle_sensor;
 static uint16_t encoder_angle_raw = 0;
 static float encoder_angle_deg = 0.0f;
+static float encoder_angle_rad = 0.0f;
 static int16_t encoder_angle_prev = 0;
 static uint32_t encoder_last_time = 0;
 
-/* Open-loop state */
-static float ol_electrical_angle = 0.0f;
-static uint32_t ol_start_time = 0;
+/* FOC state */
+static float electrical_angle_rad = 0.0f;
+static FOC_SensorData foc_sensors;
+static FOC_Output foc_output;
 
 /* USER CODE END PV */
 
@@ -172,30 +178,10 @@ __attribute__((unused)) static void DisablePwmOutputs(void)
   HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_3);
 }
 
-static void OpenLoopSVPWM(float vd, float vq, float elec_angle, float bus_v, float *du, float *dv, float *dw)
+static float CurrentMvToAmps(int32_t mv_offset)
 {
-  float sin_t, cos_t;
-  FOC_SinCos(elec_angle, &sin_t, &cos_t);
-
-  float v_alpha = vd * cos_t - vq * sin_t;
-  float v_beta  = vd * sin_t + vq * cos_t;
-
-  float v_u = v_alpha;
-  float v_v = -0.5f * v_alpha + 0.866025404f * v_beta;
-  float v_w = -0.5f * v_alpha - 0.866025404f * v_beta;\
-
-  /* SVPWM center-clamping */
-  float v_max = v_u > v_v ? v_u : v_v; if (v_w > v_max) v_max = v_w;
-  float v_min = v_u < v_v ? v_u : v_v; if (v_w < v_min) v_min = v_w;
-  float v_offset = 0.5f * (v_max + v_min);
-  v_u -= v_offset;
-  v_v -= v_offset;
-  v_w -= v_offset;
-
-  float inv_bus = 1.0f / bus_v;
-  *du = 0.5f + v_u * inv_bus;
-  *dv = 0.5f + v_v * inv_bus;
-  *dw = 0.5f + v_w * inv_bus;
+  /* Convert millivolt offset from zero to Amperes */
+  return ((float)mv_offset / 1000.0f) / ((float)CURRENT_SENSE_MV_PER_A / 1000.0f);
 }
 
 /* USER CODE END 0 */
@@ -244,11 +230,15 @@ int main(void)
 
   UART_Send("Hello, Mako Shortfin!\n");
   printf("Clock: %lu Hz\r\n", SystemCoreClock);
-  printf("=== Open-Loop FOC Spin Test ===\r\n");
-  printf("Vq=1.5V  Speed=10 rad/s  Poles=%u\r\n", FOC_POLE_PAIRS);
+  printf("=== Closed-Loop FOC Control ===\r\n");
+  printf("Iq_ref=%.1fA  Id_ref=%.1fA  Poles=%u\r\n", FOC_IQ_REF_A, FOC_ID_REF_A, FOC_POLE_PAIRS);
+  printf("Current PI: Kp=%.2f Ki=%.1f\r\n", FOC_KP_Q, FOC_KI_Q);
 
   FOC_Init();
   FOC_SetPolePairs(FOC_POLE_PAIRS);
+  FOC_SetControlPeriod(FOC_DT_SECONDS);
+  FOC_SetCurrentGains(FOC_KP_D, FOC_KI_D, FOC_KP_Q, FOC_KI_Q);
+  FOC_SetCurrentRefs(FOC_ID_REF_A, FOC_IQ_REF_A);
 
   /* A1333 Encoder Init */
   A1333_Status a1333_status = A1333_Init(&angle_sensor, &hspi3, A1333_CS_PORT, A1333_CS_PIN);
@@ -306,32 +296,28 @@ int main(void)
 
   printf("ADC zeroed: Ia=%lu mV, Ib=%lu mV\r\n", ia_zero_mv, ib_zero_mv);
 
-  /* Alignment phase */
-  SetPwmDuties(0.5f, 0.5f, 0.5f);
-  EnablePwmOutputs();
-  __HAL_TIM_MOE_ENABLE(&htim1);
+  /* Set FOC current offsets */
+  FOC_SetCurrentOffsets(
+    CurrentMvToAmps((int32_t)ia_zero_mv - CURRENT_ZERO_MV),
+    CurrentMvToAmps((int32_t)ib_zero_mv - CURRENT_ZERO_MV),
+    0.0f  /* Ic is calculated from Ia + Ib */
+  );
 
   /* Read bus voltage for SVPWM scaling */
   uint32_t raw_opamp = ReadAdcInjectedCounts(&hadc1);
   uint32_t mv_opamp = AdcCountsToMv(raw_opamp);
   float bus_v = ((float)mv_opamp / 1000.0f) * BUS_VOLTAGE_DIVIDER_RATIO;
-  printf("Bus: %ld.%01ld V | Aligning rotor...\r\n",
+  printf("Bus: %ld.%01ld V\r\n",
          (int32_t)bus_v, (int32_t)((bus_v - (int32_t)bus_v) * 10.0f));
 
-  {
-    float du, dv, dw;
-    OpenLoopSVPWM(0.0f, OL_ALIGN_VOLTAGE, 0.0f, bus_v, &du, &dv, &dw);
-    SetPwmDuties(du, dv, dw);
-  }
-  HAL_Delay(OL_ALIGN_TIME_MS);
-  printf("Open-loop spin started.\r\n\r\n");
+  /* Enable PWM outputs */
+  SetPwmDuties(0.5f, 0.5f, 0.5f);
+  EnablePwmOutputs();
+  __HAL_TIM_MOE_ENABLE(&htim1);
 
-  /* ---- Phase 2: Open-loop spin ---- */
-  ol_electrical_angle = 0.0f;
-  ol_start_time = HAL_GetTick();
+  printf("FOC control started.\r\n\r\n");
 
   uint32_t last_print_ms = HAL_GetTick();
-  float du = 0.5f, dv = 0.5f, dw = 0.5f;  /* PWM duty cycles */
 
   /* USER CODE END 2 */
 
@@ -343,47 +329,66 @@ int main(void)
     /* USER CODE BEGIN 3 */
     uint32_t loop_start = HAL_GetTick();
 
-    /* Advance electrical angle with fixed time step */
-    float dt_s = (float)OL_LOOP_PERIOD_MS * 0.001f;
-    ol_electrical_angle += OL_SPEED_RAD_S * dt_s;
-    if (ol_electrical_angle > TWO_PI_F) ol_electrical_angle -= TWO_PI_F;
-
-    /* Compute SVPWM and drive motor */
-    OpenLoopSVPWM(OL_VD, OL_VQ, ol_electrical_angle, bus_v, &du, &dv, &dw);
-    SetPwmDuties(du, dv, dw);
-
-    /* Read encoder (non-blocking) */
+    /* Read encoder angle (mechanical) */
     A1333_ReadAngle15(&angle_sensor, &encoder_angle_raw, &encoder_angle_deg);
+    encoder_angle_rad = encoder_angle_deg * (TWO_PI_F / 360.0f);
 
-    /* Telemetry every 5ms */
+    /* Calculate electrical angle from mechanical angle */
+    electrical_angle_rad = encoder_angle_rad * (float)FOC_POLE_PAIRS;
+    while (electrical_angle_rad > TWO_PI_F) electrical_angle_rad -= TWO_PI_F;
+    while (electrical_angle_rad < 0.0f) electrical_angle_rad += TWO_PI_F;
+
+    /* Read phase currents from DMA buffer */
+    uint32_t raw = adc_dual_raw;
+    uint16_t raw_ia = (uint16_t)(raw & 0xFFFF);
+    uint16_t raw_ib = (uint16_t)(raw >> 16);
+    uint32_t mv_ia = AdcCountsToMv(raw_ia);
+    uint32_t mv_ib = AdcCountsToMv(raw_ib);
+
+    /* Convert to Amperes */
+    foc_sensors.ia = CurrentMvToAmps((int32_t)mv_ia - (int32_t)ia_zero_mv);
+    foc_sensors.ib = CurrentMvToAmps((int32_t)mv_ib - (int32_t)ib_zero_mv);
+    foc_sensors.ic = -(foc_sensors.ia + foc_sensors.ib);
+    foc_sensors.bus_v = bus_v;
+    foc_sensors.electrical_angle = electrical_angle_rad;
+
+    /* Update FOC with sensor data */
+    FOC_UpdateSensors(&foc_sensors);
+
+    /* Run FOC control loop */
+    FOC_Run(&foc_output);
+
+    /* Apply PWM duty cycles */
+    SetPwmDuties(foc_output.duty_u, foc_output.duty_v, foc_output.duty_w);
+
+    /* Telemetry every 20ms */
     if ((loop_start - last_print_ms) >= 20U)
     {
       last_print_ms = loop_start;
 
-      /* Read phase currents from DMA buffer */
-      uint32_t raw = adc_dual_raw;
-      uint16_t raw_ia = (uint16_t)(raw & 0xFFFF);
-      uint16_t raw_ib = (uint16_t)(raw >> 16);
-      uint32_t mv_ia = AdcCountsToMv(raw_ia);
-      uint32_t mv_ib = AdcCountsToMv(raw_ib);
-      int32_t ia_ma = ((int32_t)mv_ia - (int32_t)ia_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
-      int32_t ib_ma = ((int32_t)mv_ib - (int32_t)ib_zero_mv) * (1000 / CURRENT_SENSE_MV_PER_A);
-      int32_t ic_ma = -(ia_ma + ib_ma);
+      int32_t ia_ma = (int32_t)(foc_sensors.ia * 1000.0f);
+      int32_t ib_ma = (int32_t)(foc_sensors.ib * 1000.0f);
+      int32_t ic_ma = (int32_t)(foc_sensors.ic * 1000.0f);
 
-      int32_t el_deg = (int32_t)(ol_electrical_angle * 57.2957795f);
+      int32_t id_ma = (int32_t)(foc_output.id_ref * 1000.0f);
+      int32_t iq_ma = (int32_t)(foc_output.iq_ref * 1000.0f);
+
+      int32_t vd_mv = (int32_t)(foc_output.vd * 1000.0f);
+      int32_t vq_mv = (int32_t)(foc_output.vq * 1000.0f);
+
+      int32_t el_deg = (int32_t)(electrical_angle_rad * 57.2957795f);
       int32_t enc_mech = (int32_t)encoder_angle_deg;
-      int32_t enc_elec = (enc_mech * (int32_t)FOC_POLE_PAIRS) % 360;
 
-      int32_t du_pct = (int32_t)(du * 100.0f);
-      int32_t dv_pct = (int32_t)(dv * 100.0f);
-      int32_t dw_pct = (int32_t)(dw * 100.0f);
+      int32_t du_pct = (int32_t)(foc_output.duty_u * 100.0f);
+      int32_t dv_pct = (int32_t)(foc_output.duty_v * 100.0f);
+      int32_t dw_pct = (int32_t)(foc_output.duty_w * 100.0f);
 
-      printf("θe:%4ld° EncE:%4ld° Mech:%4ld° | Iu:%5ldmA Iv:%5ldmA Iw:%5ldmA | D:%ld/%ld/%ld%%\r\n",
-             el_deg, enc_elec, enc_mech, ia_ma, ib_ma, ic_ma, du_pct, dv_pct, dw_pct);
+      printf("θe:%3ld° θm:%3ld° | Ia:%5ldmA Ib:%5ldmA Ic:%5ldmA | Vd:%4ldmV Vq:%4ldmV | D:%ld/%ld/%ld%%\r\n",
+             el_deg, enc_mech, ia_ma, ib_ma, ic_ma, vd_mv, vq_mv, du_pct, dv_pct, dw_pct);
     }
 
     /* Fixed loop timing: wait until period elapsed */
-    while ((HAL_GetTick() - loop_start) < OL_LOOP_PERIOD_MS) {
+    while ((HAL_GetTick() - loop_start) < FOC_LOOP_PERIOD_MS) {
       /* Busy wait for consistent timing */
     }
   }
