@@ -63,7 +63,7 @@
 #define A1333_CS_PIN GPIO_PIN_15
 
 /* FOC control parameters */
-#define FOC_IQ_REF_A      4.0f       /* Target q-axis current - below saturation for headroom */
+#define FOC_IQ_REF_A      5.0f       /* Target q-axis current - below saturation for headroom */
 #define FOC_ID_REF_A      0.1f       /* Target d-axis current (flux weakening) */
 #define FOC_KP_D          0.6f       /* D-axis PI controller Kp */
 #define FOC_KI_D          4.7f       /* D-axis PI controller Ki */
@@ -318,7 +318,10 @@ static void UART_SendNonBlocking(const char *buf, uint16_t len)
 {
   if (uart_tx_busy) return;  /* Drop if previous transfer not done */
   uart_tx_busy = 1;
-  HAL_UART_Transmit_IT(&huart1, (uint8_t *)buf, len);
+  if (HAL_UART_Transmit_IT(&huart1, (uint8_t *)buf, len) != HAL_OK)
+  {
+    uart_tx_busy = 0;  /* Failed to start — unlock for next try */
+  }
 }
 
 /* USER CODE END 0 */
@@ -362,9 +365,10 @@ int main(void)
   MX_OPAMP3_Init();
   /* USER CODE BEGIN 2 */
 
-  /* Configure NVIC priorities */
+  /* Configure NVIC priorities (RX pin not connected — disable RX interrupt to prevent floating-pin noise) */
   HAL_NVIC_SetPriority(USART1_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(USART1_IRQn);
+  __HAL_UART_DISABLE_IT(&huart1, UART_IT_RXNE);
 
   /* Enable UCC27302A gate driver (PC7, PC8, PC9) */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_SET);
@@ -526,9 +530,7 @@ int main(void)
   IWDG->KR  = 0xCCCCU;    /* Start watchdog */
   printf("IWDG watchdog started (~1s timeout)\r\n");
 
-  /* Start UART receive interrupt for kill switch (send 'k' to disable FOC) */
-  HAL_UART_Receive_IT(&huart1, &uart_rx_byte, UART_RX_BUF_SIZE);
-  printf("Safety: OC=25A, Bus=[%ld-%ldV], UART 'k'=kill\r\n\r\n",
+  printf("Safety: OC=25A, Bus=[%ld-%ldV]\r\n\r\n",
          (int32_t)MIN_BUS_VOLTAGE, (int32_t)MAX_BUS_VOLTAGE);
 
   uint32_t last_print_ms = HAL_GetTick();
@@ -711,19 +713,6 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
   }
 }
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART1)
-  {
-    if (uart_rx_byte == 'k' || uart_rx_byte == 'K')
-    {
-      foc_isr_enabled = 0;
-      foc_fault_code = 4;  /* user kill */
-    }
-    /* Re-arm receive for next byte */
-    HAL_UART_Receive_IT(&huart1, &uart_rx_byte, UART_RX_BUF_SIZE);
-  }
-}
 /* USER CODE END 4 */
 
 /**
