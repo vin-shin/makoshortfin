@@ -45,9 +45,9 @@ void MX_TIM1_Init(void)
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 0;
   htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED1;
-  htim1.Init.Period = 2833;
+  htim1.Init.Period = 2125;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 1;  /* Update every 2nd underflow = 15 kHz FOC rate */
+  htim1.Init.RepetitionCounter = 1;  /* Update every 2nd underflow = 20 kHz FOC rate */
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
   {
@@ -101,7 +101,7 @@ void MX_TIM1_Init(void)
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
   /* 400 ns deadtime: TIM1 runs at 170 MHz, so 1 tick = ~5.88 ns. 400 ns / 5.88 ns ~ 68 ticks. */
-  sBreakDeadTimeConfig.DeadTime = 52;
+  sBreakDeadTimeConfig.DeadTime = 38;
   sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
   sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
   sBreakDeadTimeConfig.BreakFilter = 0;

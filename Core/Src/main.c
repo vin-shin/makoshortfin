@@ -63,14 +63,14 @@
 #define A1333_CS_PIN GPIO_PIN_15
 
 /* FOC control parameters */
-#define FOC_IQ_REF_A      2.0f       /* Target q-axis current - below saturation for headroom */
-#define FOC_ID_REF_A      0.0f       /* Target d-axis current (flux weakening) */
-#define FOC_KP_D          0.5f       /* D-axis PI controller Kp */
-#define FOC_KI_D          4.0f       /* D-axis PI controller Ki */
-#define FOC_KP_Q          0.5f       /* Q-axis PI controller Kp */
-#define FOC_KI_Q          4.0f       /* Q-axis PI controller Ki */
-#define TIM1_PERIOD       2833U      /* TIM1 ARR value (center-aligned: 170MHz / 2*2833 = 30 kHz) */
-#define FOC_ISR_FREQ_HZ   15000U     /* FOC ISR rate (center-aligned RCR=1, every 2nd underflow) */
+#define FOC_IQ_REF_A      4.0f       /* Target q-axis current - below saturation for headroom */
+#define FOC_ID_REF_A      0.1f       /* Target d-axis current (flux weakening) */
+#define FOC_KP_D          0.6f       /* D-axis PI controller Kp */
+#define FOC_KI_D          4.7f       /* D-axis PI controller Ki */
+#define FOC_KP_Q          0.6f       /* Q-axis PI controller Kp */
+#define FOC_KI_Q          4.7f       /* Q-axis PI controller Ki */
+#define TIM1_PERIOD       2125U      /* TIM1 ARR value (center-aligned: 170MHz / 2*2125 = 40 kHz) */
+#define FOC_ISR_FREQ_HZ   20000U     /* FOC ISR rate (center-aligned RCR=1, every 2nd underflow) */
 #define FOC_ISR_DT_SECONDS (1.0f / (float)FOC_ISR_FREQ_HZ)
 #define FOC_ALIGN_TIME_MS 1000U      /* Rotor alignment time in ms */
 #define FOC_ALIGN_VOLTAGE 6.0f       /* Alignment voltage (high for repeatable offset with 20pp motor) */
@@ -79,7 +79,7 @@
 #define UART_TX_BUF_SIZE  256U       /* Non-blocking UART transmit buffer */
 
 /* Safety limits */
-#define MAX_BUS_VOLTAGE   30.0f     /* Overvoltage shutdown threshold (V) */
+#define MAX_BUS_VOLTAGE   50.0f     /* Overvoltage shutdown threshold (V) */
 #define MIN_BUS_VOLTAGE   8.0f      /* Undervoltage shutdown threshold (V) */
 
 /* UART kill switch */
@@ -552,7 +552,7 @@ int main(void)
       {
         /* Only start injected when TIM1 counter is far from ADC trigger (CH4=2832) and ISR (cnt=0) */
         uint32_t cnt = __HAL_TIM_GET_COUNTER(&htim1);
-        if (cnt > 200U && cnt < 2400U)
+        if (cnt > 200U && cnt < 1800U)
         {
           HAL_ADCEx_InjectedStart(&hadc1);
           bv_state = BV_WAIT;
