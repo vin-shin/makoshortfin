@@ -40,11 +40,13 @@
 #define A1333_NOP_CMD       0x0000U
 #define FOC_POLE_PAIRS      20U
 #define TWO_PI_F            6.28318530718f
-#define TIM1_PERIOD         5666U
+#define TIM1_PERIOD         2833U
 #define TIM1_HALF_PERIOD    (TIM1_PERIOD / 2U)
 #define SPI_TIMEOUT_CYCLES  5100U     /* ~30us at 170MHz — SPI completes in <10us */
 #define SPI_MAX_CONSECUTIVE_FAILS 5U  /* Disable FOC after N consecutive SPI failures */
-#define ABSOLUTE_MAX_CURRENT_A 25.0f  /* Hard overcurrent shutdown threshold */
+#define ABSOLUTE_MAX_CURRENT_A 8.0f   /* Conservative: allow 8A peaks for PI settling */
+#define DISABLE_OC_FOR_DEBUG 1        /* TEMP: disabled to observe steady-state behavior */
+#define INVERT_CURRENT_POLARITY 1     /* Confirmed: windup test shows INVERT=1 is correct sign */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -81,6 +83,7 @@ extern volatile uint32_t foc_isr_count;
 extern volatile uint32_t foc_isr_max_cycles;
 extern float encoder_offset_rad;
 extern volatile uint8_t foc_fault_code;
+extern uint32_t adc_vref_mv;
 extern volatile float shared_id_measured;
 extern volatile float shared_iq_measured;
 extern volatile float shared_vd;
@@ -274,9 +277,9 @@ static float ReadEncoderInISR(void)
   A1333_CS_PORT->BSRR = A1333_CS_PIN;       /* CS high */
   if (rx1 == 0xFFFF) goto spi_fail;
 
-  /* Brief idle delay (>200ns, ~34 cycles at 170MHz) */
-  __NOP(); __NOP(); __NOP(); __NOP();
-  __NOP(); __NOP(); __NOP(); __NOP();
+  /* CS-high idle delay >350ns for reliable A1333 framing.
+   * DWT cycle counter: 60 ticks at 170 MHz = ~353ns */
+  { uint32_t t0 = DWT->CYCCNT; while ((DWT->CYCCNT - t0) < 60U); }
 
   /* Frame 2: Send NOP, read angle response */
   A1333_CS_PORT->BRR = A1333_CS_PIN;        /* CS low */
@@ -336,21 +339,40 @@ void TIM1_UP_TIM16_IRQHandler(void)
   uint16_t raw_ib = (uint16_t)(raw >> 16);
 
   /* Convert ADC counts -> millivolts -> Amps (inlined for speed) */
-  float ia_mv = (float)(raw_ia * 3300U) / 4095.0f;
-  float ib_mv = (float)(raw_ib * 3300U) / 4095.0f;
-  float ia = (ia_mv - (float)ia_zero_mv) / 20.0f;  /* 20 mV/A sensitivity */
+  float ia_mv = (float)(raw_ia * adc_vref_mv) / 4095.0f;
+  float ib_mv = (float)(raw_ib * adc_vref_mv) / 4095.0f;
+
+#if INVERT_CURRENT_POLARITY
+  /* Inverted polarity: if sensors are mounted backwards or measure opposite direction */
+  float ia = -((ia_mv - (float)ia_zero_mv) / 20.0f);
+  float ib = -((ib_mv - (float)ib_zero_mv) / 20.0f);
+#else
+  /* Normal polarity: higher voltage = positive current INTO motor */
+  float ia = (ia_mv - (float)ia_zero_mv) / 20.0f;
   float ib = (ib_mv - (float)ib_zero_mv) / 20.0f;
+#endif
 
   /* 1b. Overcurrent protection */
+#if !DISABLE_OC_FOR_DEBUG
   if (fabsf(ia) > ABSOLUTE_MAX_CURRENT_A || fabsf(ib) > ABSOLUTE_MAX_CURRENT_A)
   {
     foc_isr_enabled = 0;
     foc_fault_code = 1;  /* overcurrent */
+
+    /* Debug: Store raw values for main loop to print (no floats) */
+    static volatile uint32_t debug_raw_ia, debug_raw_ib, debug_zero_ia, debug_zero_ib;
+    debug_raw_ia = (uint32_t)ia_mv;
+    debug_raw_ib = (uint32_t)ib_mv;
+    debug_zero_ia = ia_zero_mv;
+    debug_zero_ib = ib_zero_mv;
+    (void)debug_raw_ia; (void)debug_raw_ib; (void)debug_zero_ia; (void)debug_zero_ib;
+
     TIM1->CCR1 = TIM1_HALF_PERIOD;
     TIM1->CCR2 = TIM1_HALF_PERIOD;
     TIM1->CCR3 = TIM1_HALF_PERIOD;
     return;
   }
+#endif
 
   /* 2. Read encoder angle directly via SPI (no main-loop latency) */
   float elec_angle = ReadEncoderInISR();
