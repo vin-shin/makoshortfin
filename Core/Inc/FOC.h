@@ -20,6 +20,8 @@ typedef struct
 {
   float id_ref;
   float iq_ref;
+  float id_measured;
+  float iq_measured;
   float vd;
   float vq;
   float duty_u;

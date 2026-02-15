@@ -63,7 +63,7 @@
 #define A1333_CS_PIN GPIO_PIN_15
 
 /* FOC control parameters */
-#define FOC_IQ_REF_A      2.0f       /* Target q-axis current (torque) in Amps */
+#define FOC_IQ_REF_A      0.0f       /* Target q-axis current (torque) in Amps */
 #define FOC_ID_REF_A      0.0f       /* Target d-axis current (flux weakening) */
 #define FOC_KP_D          0.1f       /* D-axis PI controller Kp (tuned for 15kHz) */
 #define FOC_KI_D          50.0f      /* D-axis PI controller Ki */
@@ -76,6 +76,13 @@
 #define FOC_ALIGN_VOLTAGE 1.5f       /* Alignment voltage */
 #define BUS_V_UPDATE_MS   100U       /* Bus voltage re-read interval */
 #define UART_TX_BUF_SIZE  256U       /* Non-blocking UART transmit buffer */
+
+/* Safety limits */
+#define MAX_BUS_VOLTAGE   30.0f     /* Overvoltage shutdown threshold (V) */
+#define MIN_BUS_VOLTAGE   8.0f      /* Undervoltage shutdown threshold (V) */
+
+/* UART kill switch */
+#define UART_RX_BUF_SIZE  1U
 
 PUTCHAR_PROTOTYPE
 {
@@ -108,9 +115,21 @@ volatile uint32_t foc_isr_max_cycles = 0;
 static A1333_Handle angle_sensor;
 float encoder_offset_rad = 0.0f;  /* Non-static: ISR reads this */
 
+/* Fault reporting (0=no fault, 1=overcurrent, 2=overvoltage, 3=undervoltage, 4=user kill) */
+volatile uint8_t foc_fault_code = 0;
+
+/* ISR -> main telemetry: measured dq currents and PI voltage outputs */
+volatile float shared_id_measured = 0.0f;
+volatile float shared_iq_measured = 0.0f;
+volatile float shared_vd = 0.0f;
+volatile float shared_vq = 0.0f;
+
 /* Non-blocking UART telemetry */
 static char uart_tx_buf[UART_TX_BUF_SIZE];
 static volatile uint8_t uart_tx_busy = 0;
+
+/* UART receive for kill switch */
+static uint8_t uart_rx_byte = 0;
 
 /* USER CODE END PV */
 
@@ -408,7 +427,19 @@ int main(void)
 
   /* Start FOC processing in ISR */
   foc_isr_enabled = 1;
-  printf("FOC ISR started @ %u Hz\r\n\r\n", FOC_ISR_FREQ_HZ);
+  printf("FOC ISR started @ %u Hz\r\n", FOC_ISR_FREQ_HZ);
+
+  /* Start IWDG watchdog (~1s timeout) */
+  IWDG->KR  = 0x5555U;   /* Unlock registers */
+  IWDG->PR  = 4U;         /* Prescaler /64 -> 40kHz/64 = 625Hz */
+  IWDG->RLR = 625U;       /* Reload -> ~1s timeout */
+  IWDG->KR  = 0xCCCCU;    /* Start watchdog */
+  printf("IWDG watchdog started (~1s timeout)\r\n");
+
+  /* Start UART receive interrupt for kill switch (send 'k' to disable FOC) */
+  HAL_UART_Receive_IT(&huart1, &uart_rx_byte, UART_RX_BUF_SIZE);
+  printf("Safety: OC=10A, Bus=[%.0f-%.0fV], UART 'k'=kill\r\n\r\n",
+         MIN_BUS_VOLTAGE, MAX_BUS_VOLTAGE);
 
   uint32_t last_print_ms = HAL_GetTick();
 
@@ -450,13 +481,23 @@ int main(void)
           shared_bus_voltage = v;
           __enable_irq();
 
+          /* Bus voltage window check */
+          if (foc_isr_enabled && (v > MAX_BUS_VOLTAGE || v < MIN_BUS_VOLTAGE))
+          {
+            foc_isr_enabled = 0;
+            foc_fault_code = (v > MAX_BUS_VOLTAGE) ? 2 : 3;
+          }
+
           bv_state = BV_IDLE;
           bv_last_ms = now;
         }
       }
     }
 
-    /* --- Task 2: Non-blocking telemetry every 20ms --- */
+    /* --- Task 2: Refresh watchdog --- */
+    IWDG->KR = 0xAAAAU;
+
+    /* --- Task 3: Non-blocking telemetry every 20ms --- */
     if ((now - last_print_ms) >= 20U)
     {
       last_print_ms = now;
@@ -468,13 +509,35 @@ int main(void)
 
       int32_t el_deg = (int32_t)(shared_electrical_angle * 57.2957795f);
       int32_t bus_mv = (int32_t)(shared_bus_voltage * 1000.0f);
+      float id_m = shared_id_measured;
+      float iq_m = shared_iq_measured;
+      float vd_out = shared_vd;
+      float vq_out = shared_vq;
 
-      int len = snprintf(uart_tx_buf, UART_TX_BUF_SIZE,
-             "θe:%3ld° Bus:%ld.%01ldV ISR:%luHz peak:%.1fus\r\n",
-             el_deg,
-             bus_mv / 1000, (bus_mv % 1000) / 100,
-             isr_cnt * 50UL,  /* counts per 20ms * 50 = counts/sec */
-             max_us);
+      int len;
+      if (foc_fault_code)
+      {
+        static const char *fault_names[] = {
+          "none", "OVERCURRENT", "OVERVOLTAGE", "UNDERVOLTAGE", "USER_KILL"
+        };
+        const char *fname = (foc_fault_code <= 4) ? fault_names[foc_fault_code] : "UNKNOWN";
+        len = snprintf(uart_tx_buf, UART_TX_BUF_SIZE,
+               "FAULT:%s Bus:%ld.%01ldV id:%.2f iq:%.2f\r\n",
+               fname,
+               bus_mv / 1000, (bus_mv % 1000) / 100,
+               (double)id_m, (double)iq_m);
+      }
+      else
+      {
+        len = snprintf(uart_tx_buf, UART_TX_BUF_SIZE,
+               "θe:%3ld° Bus:%ld.%01ldV id:%.2f iq:%.2f vd:%.1f vq:%.1f %luHz %.1fus\r\n",
+               el_deg,
+               bus_mv / 1000, (bus_mv % 1000) / 100,
+               (double)id_m, (double)iq_m,
+               (double)vd_out, (double)vq_out,
+               isr_cnt * 50UL,
+               (double)max_us);
+      }
       if (len > 0) UART_SendNonBlocking(uart_tx_buf, (uint16_t)len);
 
       foc_isr_count = 0;       /* Reset count for next telemetry period */
@@ -536,6 +599,20 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
   if (huart->Instance == USART1)
   {
     uart_tx_busy = 0;
+  }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    if (uart_rx_byte == 'k' || uart_rx_byte == 'K')
+    {
+      foc_isr_enabled = 0;
+      foc_fault_code = 4;  /* user kill */
+    }
+    /* Re-arm receive for next byte */
+    HAL_UART_Receive_IT(&huart1, &uart_rx_byte, UART_RX_BUF_SIZE);
   }
 }
 /* USER CODE END 4 */

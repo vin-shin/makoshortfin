@@ -192,6 +192,8 @@ void FOC_Run(FOC_Output *out)
   {
     out->id_ref = s_id_ref;
     out->iq_ref = s_iq_ref;
+    out->id_measured = 0.0f;
+    out->iq_measured = 0.0f;
     out->vd = 0.0f;
     out->vq = 0.0f;
     out->duty_u = 0.5f;
@@ -205,6 +207,8 @@ void FOC_Run(FOC_Output *out)
   {
     out->id_ref = s_id_ref;
     out->iq_ref = s_iq_ref;
+    out->id_measured = 0.0f;
+    out->iq_measured = 0.0f;
     out->vd = 0.0f;
     out->vq = 0.0f;
     out->duty_u = 0.5f;
@@ -227,6 +231,9 @@ void FOC_Run(FOC_Output *out)
 
   float i_d = i_alpha * cos_t + i_beta * sin_t;
   float i_q = -i_alpha * sin_t + i_beta * cos_t;
+
+  out->id_measured = i_d;
+  out->iq_measured = i_q;
 
   float id_error = s_id_ref - i_d;
   float iq_error = s_iq_ref - i_q;

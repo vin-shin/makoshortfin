@@ -44,6 +44,7 @@
 #define TIM1_HALF_PERIOD    (TIM1_PERIOD / 2U)
 #define SPI_TIMEOUT_CYCLES  5100U     /* ~30us at 170MHz — SPI completes in <10us */
 #define SPI_MAX_CONSECUTIVE_FAILS 5U  /* Disable FOC after N consecutive SPI failures */
+#define ABSOLUTE_MAX_CURRENT_A 25.0f  /* Hard overcurrent shutdown threshold */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -79,6 +80,11 @@ extern volatile uint8_t foc_isr_enabled;
 extern volatile uint32_t foc_isr_count;
 extern volatile uint32_t foc_isr_max_cycles;
 extern float encoder_offset_rad;
+extern volatile uint8_t foc_fault_code;
+extern volatile float shared_id_measured;
+extern volatile float shared_iq_measured;
+extern volatile float shared_vd;
+extern volatile float shared_vq;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -335,6 +341,17 @@ void TIM1_UP_TIM16_IRQHandler(void)
   float ia = (ia_mv - (float)ia_zero_mv) / 20.0f;  /* 20 mV/A sensitivity */
   float ib = (ib_mv - (float)ib_zero_mv) / 20.0f;
 
+  /* 1b. Overcurrent protection */
+  if (fabsf(ia) > ABSOLUTE_MAX_CURRENT_A || fabsf(ib) > ABSOLUTE_MAX_CURRENT_A)
+  {
+    foc_isr_enabled = 0;
+    foc_fault_code = 1;  /* overcurrent */
+    TIM1->CCR1 = TIM1_HALF_PERIOD;
+    TIM1->CCR2 = TIM1_HALF_PERIOD;
+    TIM1->CCR3 = TIM1_HALF_PERIOD;
+    return;
+  }
+
   /* 2. Read encoder angle directly via SPI (no main-loop latency) */
   float elec_angle = ReadEncoderInISR();
   float bus_v = shared_bus_voltage;
@@ -353,6 +370,12 @@ void TIM1_UP_TIM16_IRQHandler(void)
   FOC_Output output;
   FOC_UpdateSensors(&sensors);
   FOC_Run(&output);
+
+  /* 3b. Export FOC internals for main-loop telemetry */
+  shared_id_measured = output.id_measured;
+  shared_iq_measured = output.iq_measured;
+  shared_vd = output.vd;
+  shared_vq = output.vq;
 
   /* 4. Apply PWM via direct register writes (clamped to [0, TIM1_PERIOD]) */
   float ccr_u = output.duty_u * (float)TIM1_PERIOD;
