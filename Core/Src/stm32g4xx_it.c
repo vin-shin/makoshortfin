@@ -40,7 +40,7 @@
 #define A1333_NOP_CMD       0x0000U
 #define FOC_POLE_PAIRS      20U
 #define TWO_PI_F            6.28318530718f
-#define TIM1_PERIOD         2833U
+#define TIM1_PERIOD         2125U
 #define TIM1_HALF_PERIOD    (TIM1_PERIOD / 2U)
 #define SPI_TIMEOUT_CYCLES  5100U     /* ~30us at 170MHz — SPI completes in <10us */
 #define SPI_MAX_CONSECUTIVE_FAILS 5U  /* Disable FOC after N consecutive SPI failures */
@@ -88,6 +88,7 @@ extern volatile float shared_id_measured;
 extern volatile float shared_iq_measured;
 extern volatile float shared_vd;
 extern volatile float shared_vq;
+extern volatile float shared_mechanical_angle;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -232,32 +233,36 @@ void SysTick_Handler(void)
 
 /* Direct-register SPI3 16-bit transfer.
  * Cannot use HAL_SPI_TransmitReceive here because HAL_GetTick() is frozen
- * (SysTick is lower priority than this ISR). Uses DWT cycle counter for timeout. */
+ * (SysTick is lower priority than this ISR). Uses loop counter for timeout
+ * (DWT CYCCNT may not work without debugger connected). */
 static inline uint16_t SPI3_Transfer16_Fast(uint16_t tx)
 {
-  uint32_t t0 = DWT->CYCCNT;
+  volatile uint32_t timeout;
 
   /* Wait for TX buffer empty */
+  timeout = SPI_TIMEOUT_CYCLES;
   while (!(SPI3->SR & SPI_SR_TXE))
   {
-    if ((DWT->CYCCNT - t0) > SPI_TIMEOUT_CYCLES) return 0xFFFF;
+    if (--timeout == 0U) return 0xFFFF;
   }
 
   /* Write 16-bit data */
   *((__IO uint16_t *)&SPI3->DR) = tx;
 
   /* Wait for RX buffer not empty */
+  timeout = SPI_TIMEOUT_CYCLES;
   while (!(SPI3->SR & SPI_SR_RXNE))
   {
-    if ((DWT->CYCCNT - t0) > SPI_TIMEOUT_CYCLES) return 0xFFFF;
+    if (--timeout == 0U) return 0xFFFF;
   }
 
   uint16_t rx = *((__IO uint16_t *)&SPI3->DR);
 
   /* Wait until not busy */
+  timeout = SPI_TIMEOUT_CYCLES;
   while (SPI3->SR & SPI_SR_BSY)
   {
-    if ((DWT->CYCCNT - t0) > SPI_TIMEOUT_CYCLES) return 0xFFFF;
+    if (--timeout == 0U) return 0xFFFF;
   }
 
   return rx;
@@ -278,8 +283,8 @@ static float ReadEncoderInISR(void)
   if (rx1 == 0xFFFF) goto spi_fail;
 
   /* CS-high idle delay >350ns for reliable A1333 framing.
-   * DWT cycle counter: 60 ticks at 170 MHz = ~353ns */
-  { uint32_t t0 = DWT->CYCCNT; while ((DWT->CYCCNT - t0) < 60U); }
+   * ~15 loop iterations at 170 MHz ≈ 350ns */
+  { volatile uint32_t d = 15U; while (d--); }
 
   /* Frame 2: Send NOP, read angle response */
   A1333_CS_PORT->BRR = A1333_CS_PIN;        /* CS low */
@@ -295,6 +300,7 @@ static float ReadEncoderInISR(void)
   float elec = fmodf(mech_rad * (float)FOC_POLE_PAIRS, TWO_PI_F) - encoder_offset_rad;
   if (elec < 0.0f) elec += TWO_PI_F;
 
+  shared_mechanical_angle = mech_rad;
   last_good_angle = elec;
   return elec;
 
@@ -330,8 +336,8 @@ void TIM1_UP_TIM16_IRQHandler(void)
     return;
   }
 
-  /* Start cycle counter for profiling */
-  uint32_t cyc_start = DWT->CYCCNT;
+  /* Profiling: use SysTick->VAL as a free-running downcounter (no DWT dependency) */
+  uint32_t cyc_start = SysTick->VAL;
 
   /* 1. Read phase currents from DMA buffer */
   uint32_t raw = adc_dual_raw;
@@ -343,14 +349,20 @@ void TIM1_UP_TIM16_IRQHandler(void)
   float ib_mv = (float)(raw_ib * adc_vref_mv) / 4095.0f;
 
 #if INVERT_CURRENT_POLARITY
-  /* Inverted polarity: if sensors are mounted backwards or measure opposite direction */
-  float ia = -((ia_mv - (float)ia_zero_mv) / 20.0f);
-  float ib = -((ib_mv - (float)ib_zero_mv) / 20.0f);
+  float ia_raw = -((ia_mv - (float)ia_zero_mv) / 20.0f);
+  float ib_raw = -((ib_mv - (float)ib_zero_mv) / 20.0f);
 #else
-  /* Normal polarity: higher voltage = positive current INTO motor */
-  float ia = (ia_mv - (float)ia_zero_mv) / 20.0f;
-  float ib = (ib_mv - (float)ib_zero_mv) / 20.0f;
+  float ia_raw = (ia_mv - (float)ia_zero_mv) / 20.0f;
+  float ib_raw = (ib_mv - (float)ib_zero_mv) / 20.0f;
 #endif
+
+  /* Low-pass filter on phase currents: fc ≈ 500Hz at 20kHz ISR rate
+   * alpha = 2*pi*fc*dt / (1 + 2*pi*fc*dt) ≈ 0.14 */
+  static float ia_filt = 0.0f, ib_filt = 0.0f;
+  ia_filt += 0.15f * (ia_raw - ia_filt);
+  ib_filt += 0.15f * (ib_raw - ib_filt);
+  float ia = ia_filt;
+  float ib = ib_filt;
 
   /* 1b. Overcurrent protection */
 #if !DISABLE_OC_FOR_DEBUG
@@ -410,8 +422,11 @@ void TIM1_UP_TIM16_IRQHandler(void)
   TIM1->CCR2 = (uint32_t)ccr_v;
   TIM1->CCR3 = (uint32_t)ccr_w;
 
-  /* 5. Profiling */
-  uint32_t cyc_elapsed = DWT->CYCCNT - cyc_start;
+  /* 5. Profiling (SysTick counts DOWN, so start > end for elapsed) */
+  uint32_t cyc_end = SysTick->VAL;
+  uint32_t cyc_elapsed = (cyc_start >= cyc_end)
+    ? (cyc_start - cyc_end)
+    : (cyc_start + (SysTick->LOAD + 1U) - cyc_end);
   foc_isr_count++;
   if (cyc_elapsed > foc_isr_max_cycles)
   {

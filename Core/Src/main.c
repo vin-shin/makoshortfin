@@ -63,31 +63,43 @@
 #define A1333_CS_PIN GPIO_PIN_15
 
 /* FOC control parameters */
-#define FOC_IQ_REF_A      5.0f       /* Target q-axis current - below saturation for headroom */
-#define FOC_ID_REF_A      0.1f       /* Target d-axis current (flux weakening) */
-#define FOC_KP_D          0.6f       /* D-axis PI controller Kp */
-#define FOC_KI_D          4.7f       /* D-axis PI controller Ki */
-#define FOC_KP_Q          0.6f       /* Q-axis PI controller Kp */
-#define FOC_KI_Q          4.7f       /* Q-axis PI controller Ki */
+#define FOC_IQ_REF_A      3.0f       /* Target q-axis current - below saturation for headroom */
+#define FOC_ID_REF_A      0.0f       /* Target d-axis current (0 for position control) */
+#define FOC_KP_D          0.25f      /* D-axis PI controller Kp */
+#define FOC_KI_D          2.0f       /* D-axis PI controller Ki */
+#define FOC_KP_Q          0.25f      /* Q-axis PI controller Kp */
+#define FOC_KI_Q          2.0f       /* Q-axis PI controller Ki */
 #define TIM1_PERIOD       2125U      /* TIM1 ARR value (center-aligned: 170MHz / 2*2125 = 40 kHz) */
 #define FOC_ISR_FREQ_HZ   20000U     /* FOC ISR rate (center-aligned RCR=1, every 2nd underflow) */
 #define FOC_ISR_DT_SECONDS (1.0f / (float)FOC_ISR_FREQ_HZ)
 #define FOC_ALIGN_TIME_MS 1000U      /* Rotor alignment time in ms */
 #define FOC_ALIGN_VOLTAGE 6.0f       /* Alignment voltage (high for repeatable offset with 20pp motor) */
 #define ENCODER_OFFSET_TRIM_RAD 0.0f   /* Trim disabled - fix bus voltage ratio instead */
-#define BUS_V_UPDATE_MS   60000U     /* DIAGNOSTIC: disabled to test if injected ADC causes current spikes */
+#define BUS_V_UPDATE_MS   2000U      /* Bus voltage refresh every 2s */
 #define UART_TX_BUF_SIZE  256U       /* Non-blocking UART transmit buffer */
 
 /* Safety limits */
 #define MAX_BUS_VOLTAGE   50.0f     /* Overvoltage shutdown threshold (V) */
 #define MIN_BUS_VOLTAGE   8.0f      /* Undervoltage shutdown threshold (V) */
 
+/* Position control (outer loop) */
+#define POS_KP            0.5f      /* Position P gain (A/rad) — enough to overcome cogging */
+#define POS_KI            1.2f      /* Position I gain (A/(rad·s)) — pushes through cogging detents */
+#define POS_KD            0.02f     /* Position D gain (A/(rad/s)) — damping */
+#define POS_IQ_LIMIT      2.5f      /* Max iq command from position loop (A) */
+#define POS_KI_LIMIT      2.5f      /* Anti-windup: max integrator contribution (A) — match IQ_LIMIT */
+#define POS_LOOP_MS       1U        /* Position loop period (ms) */
+#define POS_TARGET_A_DEG  0.0f      /* First target position (degrees) */
+#define POS_TARGET_B_DEG  180.0f    /* Second target position (degrees) */
+#define POS_SWITCH_MS     2000U     /* Time between target switches (ms) */
+
 /* UART kill switch */
 #define UART_RX_BUF_SIZE  1U
 
 PUTCHAR_PROTOTYPE
 {
-    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+    while (!(USART1->ISR & USART_ISR_TXE));  /* Wait for TX register empty */
+    USART1->TDR = (uint8_t)ch;               /* Write directly — bypass HAL */
     return ch;
 }
 /* USER CODE END PD */
@@ -124,13 +136,12 @@ volatile float shared_id_measured = 0.0f;
 volatile float shared_iq_measured = 0.0f;
 volatile float shared_vd = 0.0f;
 volatile float shared_vq = 0.0f;
+volatile float shared_mechanical_angle = 0.0f;
+volatile float shared_iq_ref = 0.0f;
 
-/* Non-blocking UART telemetry */
+/* UART telemetry buffer */
 static char uart_tx_buf[UART_TX_BUF_SIZE];
-static volatile uint8_t uart_tx_busy = 0;
 
-/* UART receive for kill switch */
-static uint8_t uart_rx_byte = 0;
 
 /* USER CODE END PV */
 
@@ -138,7 +149,10 @@ static uint8_t uart_rx_byte = 0;
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void UART_Send(char* message) {
-    HAL_UART_Transmit(&huart1, (uint8_t*)message, strlen(message), HAL_MAX_DELAY);
+    while (*message) {
+        while (!(USART1->ISR & USART_ISR_TXE));
+        USART1->TDR = (uint8_t)*message++;
+    }
 }
 
 /* USER CODE END PFP */
@@ -314,13 +328,12 @@ static float CalibrateEncoderOffset(float bus_v)
   return offset;
 }
 
-static void UART_SendNonBlocking(const char *buf, uint16_t len)
+static void UART_SendDirect(const char *buf, uint16_t len)
 {
-  if (uart_tx_busy) return;  /* Drop if previous transfer not done */
-  uart_tx_busy = 1;
-  if (HAL_UART_Transmit_IT(&huart1, (uint8_t *)buf, len) != HAL_OK)
+  for (uint16_t i = 0; i < len; i++)
   {
-    uart_tx_busy = 0;  /* Failed to start — unlock for next try */
+    while (!(USART1->ISR & USART_ISR_TXE));
+    USART1->TDR = (uint8_t)buf[i];
   }
 }
 
@@ -365,10 +378,9 @@ int main(void)
   MX_OPAMP3_Init();
   /* USER CODE BEGIN 2 */
 
-  /* Configure NVIC priorities (RX pin not connected — disable RX interrupt to prevent floating-pin noise) */
-  HAL_NVIC_SetPriority(USART1_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(USART1_IRQn);
-  __HAL_UART_DISABLE_IT(&huart1, UART_IT_RXNE);
+  /* RX pin not connected — disable receiver entirely to prevent floating-pin noise.
+     All UART output uses direct register writes, no IRQ needed. */
+  CLEAR_BIT(USART1->CR1, USART_CR1_RE);
 
   /* Enable UCC27302A gate driver (PC7, PC8, PC9) */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_SET);
@@ -506,22 +518,14 @@ int main(void)
   /* Reset PI integrators after alignment (keeps all config intact) */
   FOC_ResetIntegrators();
 
-  /* Enable DWT cycle counter for ISR profiling */
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  DWT->CYCCNT = 0;
-  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  /* Set Iq=0 before enabling ISR — position loop will command torque */
+  FOC_SetCurrentRefs(FOC_ID_REF_A, 0.0f);
 
   /* Set initial shared state */
   shared_electrical_angle = 0.0f;
 
-  /* Enable TIM1 Update interrupt (FOC ISR at 15 kHz) */
-  HAL_NVIC_SetPriority(TIM1_UP_TIM16_IRQn, 0, 0);  /* Highest priority */
-  HAL_NVIC_EnableIRQ(TIM1_UP_TIM16_IRQn);
-  __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
-
-  /* Start FOC processing in ISR */
-  foc_isr_enabled = 1;
-  printf("FOC ISR started @ %u Hz\r\n", FOC_ISR_FREQ_HZ);
+  /* Print all status messages BEFORE enabling ISR (printf is too slow under ISR preemption) */
+  printf("FOC ISR starting @ %u Hz\r\n", FOC_ISR_FREQ_HZ);
 
   /* Start IWDG watchdog (~1s timeout) */
   IWDG->KR  = 0x5555U;   /* Unlock registers */
@@ -534,6 +538,33 @@ int main(void)
          (int32_t)MIN_BUS_VOLTAGE, (int32_t)MAX_BUS_VOLTAGE);
 
   uint32_t last_print_ms = HAL_GetTick();
+
+  /* Position control state */
+  float pos_target_rad = POS_TARGET_A_DEG * (TWO_PI_F / 360.0f);
+  float pos_last_error = 0.0f;
+  float pos_integrator = 0.0f;
+  uint32_t pos_last_ms = HAL_GetTick();
+  uint32_t pos_switch_ms = HAL_GetTick();
+  uint8_t pos_target_idx = 0;  /* 0=A, 1=B */
+
+  printf("Position control: toggling %ld<->%ld deg every %ums\r\n",
+         (int32_t)POS_TARGET_A_DEG, (int32_t)POS_TARGET_B_DEG, POS_SWITCH_MS);
+
+  /* Fix RCR: center-aligned mode decrements RCR on BOTH overflow and underflow.
+   * ARR=2125 → 40kHz triangle → 80kHz events. RCR=3 → UEV every 4 events = 20kHz.
+   * (CubeMX had RCR=1 which gives 40kHz, exceeding ISR budget of ~28us) */
+  __HAL_TIM_SET_AUTORELOAD(&htim1, 2125);  /* Ensure ARR is correct */
+  htim1.Instance->RCR = 3U;
+  htim1.Instance->EGR = TIM_EGR_UG;  /* Force update to load RCR shadow register */
+  __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);  /* Clear UIF from EGR write */
+
+  /* Enable TIM1 Update interrupt (FOC ISR at 20 kHz) */
+  HAL_NVIC_SetPriority(TIM1_UP_TIM16_IRQn, 0, 0);  /* Highest priority */
+  HAL_NVIC_EnableIRQ(TIM1_UP_TIM16_IRQn);
+  __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+
+  /* Start FOC processing in ISR */
+  foc_isr_enabled = 1;
 
   /* USER CODE END 2 */
 
@@ -601,7 +632,49 @@ int main(void)
     /* --- Task 2: Refresh watchdog --- */
     IWDG->KR = 0xAAAAU;
 
-    /* --- Task 3: Non-blocking telemetry every 20ms --- */
+    /* --- Task 3: Position control loop every 1ms --- */
+    if (foc_isr_enabled && (now - pos_last_ms) >= POS_LOOP_MS)
+    {
+      float dt = (float)(now - pos_last_ms) * 0.001f;
+      pos_last_ms = now;
+
+      /* Toggle target every POS_SWITCH_MS */
+      if ((now - pos_switch_ms) >= POS_SWITCH_MS)
+      {
+        pos_switch_ms = now;
+        pos_target_idx ^= 1;
+        pos_target_rad = pos_target_idx
+          ? POS_TARGET_B_DEG * (TWO_PI_F / 360.0f)
+          : POS_TARGET_A_DEG * (TWO_PI_F / 360.0f);
+        pos_integrator = 0.0f;  /* Reset integrator on target change */
+      }
+
+      /* Read mechanical angle from ISR */
+      float mech = shared_mechanical_angle;
+
+      /* Position error with shortest-path wraparound */
+      float error = pos_target_rad - mech;
+      if (error > 3.14159265f) error -= TWO_PI_F;
+      if (error < -3.14159265f) error += TWO_PI_F;
+
+      /* PID controller */
+      pos_integrator += error * dt;
+      /* Anti-windup clamp */
+      if (pos_integrator > POS_KI_LIMIT / POS_KI) pos_integrator = POS_KI_LIMIT / POS_KI;
+      if (pos_integrator < -POS_KI_LIMIT / POS_KI) pos_integrator = -POS_KI_LIMIT / POS_KI;
+      float d_error = (error - pos_last_error) / dt;
+      pos_last_error = error;
+      float iq_cmd = -(POS_KP * error + POS_KI * pos_integrator + POS_KD * d_error);
+
+      /* Clamp iq command */
+      if (iq_cmd > POS_IQ_LIMIT) iq_cmd = POS_IQ_LIMIT;
+      if (iq_cmd < -POS_IQ_LIMIT) iq_cmd = -POS_IQ_LIMIT;
+
+      shared_iq_ref = iq_cmd;
+      FOC_SetCurrentRefs(FOC_ID_REF_A, iq_cmd);
+    }
+
+    /* --- Task 4: Non-blocking telemetry every 20ms --- */
     if ((now - last_print_ms) >= 20U)
     {
       last_print_ms = now;
@@ -640,16 +713,17 @@ int main(void)
       }
       else
       {
+        int32_t mech_mdeg = (int32_t)(shared_mechanical_angle * 57295.7795f);  /* mrad -> mdeg */
+        int32_t tgt_mdeg = (int32_t)(pos_target_rad * 57295.7795f);
+        int32_t iq_ref_ma = (int32_t)(shared_iq_ref * 1000.0f);
         len = snprintf(uart_tx_buf, UART_TX_BUF_SIZE,
-               "θe:%3ld° Bus:%ld.%01ldV id:%ldmA iq:%ldmA vd:%ldmV vq:%ldmV %luHz %ldus\r\n",
-               el_deg,
+               "pos:%ld>%lddeg ref:%ldmA iq:%ldmA id:%ldmA Bus:%ld.%01ldV %ldus\r\n",
+               mech_mdeg / 1000, tgt_mdeg / 1000,
+               iq_ref_ma, iq_ma, id_ma,
                bus_mv / 1000, (bus_mv % 1000) / 100,
-               id_ma, iq_ma,
-               vd_mv, vq_mv,
-               isr_cnt * 50UL,
                max_us_int);
       }
-      if (len > 0) UART_SendNonBlocking(uart_tx_buf, (uint16_t)len);
+      if (len > 0) UART_SendDirect(uart_tx_buf, (uint16_t)len);
 
       foc_isr_count = 0;       /* Reset count for next telemetry period */
       foc_isr_max_cycles = 0;  /* Reset peak tracker */
@@ -705,13 +779,6 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART1)
-  {
-    uart_tx_busy = 0;
-  }
-}
 
 /* USER CODE END 4 */
 
