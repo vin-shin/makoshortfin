@@ -1,814 +1,402 @@
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "adc.h"
-#include "fdcan.h"
-#include "opamp.h"
-#include "spi.h"
-#include "tim.h"
-#include "usart.h"
-#include "gpio.h"
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-#include <string.h>
-#include <stdio.h>
-#include "stm32g4xx_hal_dma.h"
-#include "a1333.h"
+#include "config.h"
+#include "periph_ll.h"
 #include "FOC.h"
-/* USER CODE END Includes */
+#include "encoder.h"
+#include "control.h"
+#include "uart_telem.h"
+#include <math.h>
+#include <string.h>
 
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
+/* ===== Global shared state ===== */
 
-/* USER CODE END PTD */
+/* ADC DMA destination (written by DMA, read by ISR) */
+volatile uint32_t g_adc_dual_raw = 0;
 
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-#ifdef __GNUC__
-#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
-#else
-#define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
-#endif
+/* Current zero calibration */
+volatile uint32_t g_ia_zero_counts = 2048;
+volatile uint32_t g_ib_zero_counts = 2048;
 
-#define ADC_VREF_MV 3300U
-#define ADC_MAX_COUNTS 4095U
-#define CURRENT_ZERO_MV 2500
-#define CURRENT_SENSE_MV_PER_A 20
-#define OPAMP_ADC_CHANNEL ADC_CHANNEL_12
-#define BUS_VOLTAGE_DIVIDER_RATIO 17.0f   /* Calibrated with VREFINT-corrected VDDA (resistor tolerance ~5%) */
-#define FOC_POLE_PAIRS 20U
-#define ENCODER_COUNTS_PER_REV 32768.0f
-#define TWO_PI_F 6.28318530718f
+/* Calibrated VDDA in millivolts */
+volatile uint32_t g_vdda_mv = ADC_VREF_NOM_MV;
 
-/* A1333 CS pin on PA15 (for SPI3) */
-#define A1333_CS_PORT GPIOA
-#define A1333_CS_PIN GPIO_PIN_15
+/* Bus voltage (updated in main loop, read by ISR) */
+volatile float g_bus_voltage = 0.0f;
 
-/* FOC control parameters */
-#define FOC_IQ_REF_A      3.0f       /* Target q-axis current - below saturation for headroom */
-#define FOC_ID_REF_A      0.0f       /* Target d-axis current (0 for position control) */
-#define FOC_KP_D          0.25f      /* D-axis PI controller Kp */
-#define FOC_KI_D          2.0f       /* D-axis PI controller Ki */
-#define FOC_KP_Q          0.25f      /* Q-axis PI controller Kp */
-#define FOC_KI_Q          2.0f       /* Q-axis PI controller Ki */
-#define TIM1_PERIOD       2125U      /* TIM1 ARR value (center-aligned: 170MHz / 2*2125 = 40 kHz) */
-#define FOC_ISR_FREQ_HZ   20000U     /* FOC ISR rate (center-aligned RCR=1, every 2nd underflow) */
-#define FOC_ISR_DT_SECONDS (1.0f / (float)FOC_ISR_FREQ_HZ)
-#define FOC_ALIGN_TIME_MS 1000U      /* Rotor alignment time in ms */
-#define FOC_ALIGN_VOLTAGE 6.0f       /* Alignment voltage (high for repeatable offset with 20pp motor) */
-#define ENCODER_OFFSET_TRIM_RAD 0.0f   /* Trim disabled - fix bus voltage ratio instead */
-#define BUS_V_UPDATE_MS   2000U      /* Bus voltage refresh every 2s */
-#define UART_TX_BUF_SIZE  256U       /* Non-blocking UART transmit buffer */
+/* FOC enable / fault */
+volatile uint8_t g_foc_enabled = 0;
+volatile uint8_t g_fault_code = 0;
 
-/* Safety limits */
-#define MAX_BUS_VOLTAGE   50.0f     /* Overvoltage shutdown threshold (V) */
-#define MIN_BUS_VOLTAGE   8.0f      /* Undervoltage shutdown threshold (V) */
+/* ISR -> main telemetry */
+volatile float g_mech_angle = 0.0f;
+volatile float g_elec_angle = 0.0f;
+volatile float g_id_meas = 0.0f;
+volatile float g_iq_meas = 0.0f;
+volatile float g_vd = 0.0f;
+volatile float g_vq = 0.0f;
+volatile float g_iq_ref = 0.0f;
 
-/* Position control (outer loop) */
-#define POS_KP            0.5f      /* Position P gain (A/rad) — enough to overcome cogging */
-#define POS_KI            1.2f      /* Position I gain (A/(rad·s)) — pushes through cogging detents */
-#define POS_KD            0.02f     /* Position D gain (A/(rad/s)) — damping */
-#define POS_IQ_LIMIT      2.5f      /* Max iq command from position loop (A) */
-#define POS_KI_LIMIT      2.5f      /* Anti-windup: max integrator contribution (A) — match IQ_LIMIT */
-#define POS_LOOP_MS       1U        /* Position loop period (ms) */
-#define POS_TARGET_A_DEG  0.0f      /* First target position (degrees) */
-#define POS_TARGET_B_DEG  180.0f    /* Second target position (degrees) */
-#define POS_SWITCH_MS     2000U     /* Time between target switches (ms) */
+/* ISR profiling */
+volatile uint32_t g_isr_count = 0;
+volatile uint32_t g_isr_max_cycles = 0;
 
-/* UART kill switch */
-#define UART_RX_BUF_SIZE  1U
+/* Encoder offset (set during calibration, read by ISR) */
+float g_encoder_offset = 0.0f;
 
-PUTCHAR_PROTOTYPE
+/* Position target (read by uart_telem for telemetry) */
+float g_pos_target = 0.0f;
+
+/* ===== VDDA calibration via internal VREFINT ===== */
+static void CalibrateVDDA(void)
 {
-    while (!(USART1->ISR & USART_ISR_TXE));  /* Wait for TX register empty */
-    USART1->TDR = (uint8_t)ch;               /* Write directly — bypass HAL */
-    return ch;
-}
-/* USER CODE END PD */
+    /* VREFINT factory cal was measured at 3.0V, stored at 0x1FFF75AA */
+    uint16_t vrefint_cal = *((uint16_t *)0x1FFF75AA);
 
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
+    /* Configure ADC1 injected to read VREFINT (CH18) */
+    /* Save current injected channel config */
+    uint32_t saved_jsqr = ADC1->JSQR;
 
-/* USER CODE END PM */
+    /* Set injected channel to VREFINT, software trigger */
+    ADC1->JSQR = (LL_ADC_CHANNEL_VREFINT << ADC_JSQR_JSQ1_Pos);
 
-/* Private variables ---------------------------------------------------------*/
+    /* Set long sampling time for VREFINT (247.5 cycles) */
+    /* VREFINT is on CH18 -> SMPR2 bits [26:24] */
+    uint32_t saved_smpr2 = ADC1->SMPR2;
+    ADC1->SMPR2 = (ADC1->SMPR2 & ~(0x7UL << 24)) | (0x7UL << 24); /* 247.5 cyc */
 
-/* USER CODE BEGIN PV */
-/* ISR-visible variables (non-static, accessed by TIM1 Update ISR) */
-uint32_t ia_zero_mv = CURRENT_ZERO_MV;
-uint32_t ib_zero_mv = CURRENT_ZERO_MV;
-volatile uint32_t adc_dual_raw = 0;
+    /* Enable VREFINT */
+    ADC12_COMMON->CCR |= ADC_CCR_VREFEN;
 
-/* Shared ISR <-> main loop state */
-volatile float shared_electrical_angle = 0.0f;
-volatile float shared_bus_voltage = 0.0f;
-volatile uint8_t foc_isr_enabled = 0;
-volatile uint32_t foc_isr_count = 0;
-volatile uint32_t foc_isr_max_cycles = 0;
+    /* Average 16 readings */
+    uint32_t sum = 0;
+    for (int i = 0; i < 16; i++) {
+        LL_ADC_INJ_StartConversion(ADC1);
+        while (!LL_ADC_IsActiveFlag_JEOS(ADC1)) {}
+        LL_ADC_ClearFlag_JEOS(ADC1);
+        sum += LL_ADC_INJ_ReadConversionData12(ADC1, LL_ADC_INJ_RANK_1);
+    }
+    uint32_t vrefint_raw = sum / 16;
 
-/* A1333 Encoder */
-static A1333_Handle angle_sensor;
-float encoder_offset_rad = 0.0f;  /* Non-static: ISR reads this */
+    /* Restore */
+    ADC12_COMMON->CCR &= ~ADC_CCR_VREFEN;
+    ADC1->SMPR2 = saved_smpr2;
+    ADC1->JSQR = saved_jsqr;
 
-/* Fault reporting (0=no fault, 1=overcurrent, 2=overvoltage, 3=undervoltage, 4=user kill) */
-volatile uint8_t foc_fault_code = 0;
-
-/* ISR -> main telemetry: measured dq currents and PI voltage outputs */
-volatile float shared_id_measured = 0.0f;
-volatile float shared_iq_measured = 0.0f;
-volatile float shared_vd = 0.0f;
-volatile float shared_vq = 0.0f;
-volatile float shared_mechanical_angle = 0.0f;
-volatile float shared_iq_ref = 0.0f;
-
-/* UART telemetry buffer */
-static char uart_tx_buf[UART_TX_BUF_SIZE];
-
-
-/* USER CODE END PV */
-
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-/* USER CODE BEGIN PFP */
-void UART_Send(char* message) {
-    while (*message) {
-        while (!(USART1->ISR & USART_ISR_TXE));
-        USART1->TDR = (uint8_t)*message++;
+    /* Calculate true VDDA: VDDA = 3000mV * CAL / RAW */
+    if (vrefint_raw > 0) {
+        g_vdda_mv = (3000UL * vrefint_cal) / vrefint_raw;
     }
 }
 
-/* USER CODE END PFP */
-
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
-
-static uint32_t ReadAdcInjectedCounts(ADC_HandleTypeDef *hadc)
-{
-  HAL_ADCEx_InjectedStop(hadc);  /* Stop any previous conversion */
-  HAL_Delay(1);  /* Small delay */
-
-  if (HAL_ADCEx_InjectedStart(hadc) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_ADCEx_InjectedPollForConversion(hadc, 100) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  uint32_t value = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
-  HAL_ADCEx_InjectedStop(hadc);
-  return value;
-}
-
-uint32_t adc_vref_mv = ADC_VREF_MV;  /* Updated at runtime from VREFINT */
-
-static uint32_t AdcCountsToMv(uint32_t counts)
-{
-  return (counts * adc_vref_mv) / ADC_MAX_COUNTS;
-}
-
-/* Measure true VDDA using internal VREFINT reference.
-   Must be called after ADC calibration, before DMA/regular conversions start. */
-static uint32_t MeasureVddaMv(void)
-{
-  /* Save current injected config */
-  ADC_InjectionConfTypeDef sConf = {0};
-  sConf.InjectedChannel = ADC_CHANNEL_VREFINT;
-  sConf.InjectedRank = ADC_INJECTED_RANK_1;
-  sConf.InjectedSamplingTime = ADC_SAMPLETIME_247CYCLES_5;  /* Long sample for accuracy */
-  sConf.InjectedSingleDiff = ADC_SINGLE_ENDED;
-  sConf.InjectedOffsetNumber = ADC_OFFSET_NONE;
-  sConf.InjectedOffset = 0;
-  sConf.InjectedNbrOfConversion = 1;
-  sConf.InjectedDiscontinuousConvMode = DISABLE;
-  sConf.AutoInjectedConv = DISABLE;
-  sConf.QueueInjectedContext = DISABLE;
-  sConf.ExternalTrigInjecConv = ADC_INJECTED_SOFTWARE_START;
-  sConf.ExternalTrigInjecConvEdge = ADC_EXTERNALTRIGINJECCONV_EDGE_NONE;
-  HAL_ADCEx_InjectedConfigChannel(&hadc1, &sConf);
-
-  /* Read VREFINT (average 16 samples) */
-  uint32_t sum = 0;
-  for (int i = 0; i < 16; i++)
-  {
-    sum += ReadAdcInjectedCounts(&hadc1);
-  }
-  uint32_t vrefint_raw = sum / 16;
-
-  /* Restore original bus voltage channel */
-  sConf.InjectedChannel = OPAMP_ADC_CHANNEL;
-  sConf.InjectedSamplingTime = ADC_SAMPLETIME_47CYCLES_5;
-  HAL_ADCEx_InjectedConfigChannel(&hadc1, &sConf);
-
-  /* Factory cal: VREFINT_CAL was measured at 3.0V VDDA */
-  uint16_t vrefint_cal = *((uint16_t *)0x1FFF75AAUL);
-  uint32_t vdda_mv = (3000UL * (uint32_t)vrefint_cal) / vrefint_raw;
-  return vdda_mv;
-}
-
-
-static void SetPwmDuties(float du, float dv, float dw)
-{
-  if (du < 0.0f) { du = 0.0f; } if (du > 1.0f) { du = 1.0f; }
-  if (dv < 0.0f) { dv = 0.0f; } if (dv > 1.0f) { dv = 1.0f; }
-  if (dw < 0.0f) { dw = 0.0f; } if (dw > 1.0f) { dw = 1.0f; }
-
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)(du * (float)TIM1_PERIOD));
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)(dv * (float)TIM1_PERIOD));
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)(dw * (float)TIM1_PERIOD));
-}
-
-static void EnablePwmOutputs(void)
-{
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
-}
-
-__attribute__((unused)) static void DisablePwmOutputs(void)
-{
-  HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
-  HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
-  HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_2);
-  HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_3);
-}
-
+/* ===== Bus voltage reading (blocking, for init only) ===== */
 static float ReadBusVoltageBlocking(void)
 {
-  uint32_t raw = ReadAdcInjectedCounts(&hadc1);
-  uint32_t mv = AdcCountsToMv(raw);
-  return ((float)mv / 1000.0f) * BUS_VOLTAGE_DIVIDER_RATIO;
+    /* Injected ADC1 CH12 (OPAMP3 output) */
+    LL_ADC_INJ_StartConversion(ADC1);
+    while (!LL_ADC_IsActiveFlag_JEOS(ADC1)) {}
+    LL_ADC_ClearFlag_JEOS(ADC1);
+
+    uint32_t raw = LL_ADC_INJ_ReadConversionData12(ADC1, LL_ADC_INJ_RANK_1);
+    float voltage = (float)raw * (float)g_vdda_mv / ((float)ADC_MAX_COUNTS * 1000.0f);
+    return voltage * BUS_V_DIVIDER_RATIO;
 }
 
-static void AlignRotorSVPWM(float vd, float vq, float elec_angle, float bus_v)
+/* ===== Open-loop SVPWM for rotor alignment ===== */
+static void AlignSVPWM(float vd, float vq, float elec_angle, float bus_v)
 {
-  float sin_t, cos_t;
-  FOC_SinCos(elec_angle, &sin_t, &cos_t);
+    float sin_e, cos_e;
+    FOC_SinCos(elec_angle, &sin_e, &cos_e);
 
-  float v_alpha = vd * cos_t - vq * sin_t;
-  float v_beta  = vd * sin_t + vq * cos_t;
+    float v_alpha = vd * cos_e - vq * sin_e;
+    float v_beta = vd * sin_e + vq * cos_e;
 
-  float v_u = v_alpha;
-  float v_v = -0.5f * v_alpha + 0.866025404f * v_beta;
-  float v_w = -0.5f * v_alpha - 0.866025404f * v_beta;
+    float vu = v_alpha;
+    float vv = -0.5f * v_alpha + 0.5f * SQRT3_F * v_beta;
+    float vw = -0.5f * v_alpha - 0.5f * SQRT3_F * v_beta;
 
-  float v_max = v_u > v_v ? v_u : v_v; if (v_w > v_max) v_max = v_w;
-  float v_min = v_u < v_v ? v_u : v_v; if (v_w < v_min) v_min = v_w;
-  float v_offset = 0.5f * (v_max + v_min);
-  v_u -= v_offset;
-  v_v -= v_offset;
-  v_w -= v_offset;
+    float v_max = fmaxf(vu, fmaxf(vv, vw));
+    float v_min = fminf(vu, fminf(vv, vw));
+    float v_off = 0.5f * (v_max + v_min);
+    vu -= v_off;
+    vv -= v_off;
+    vw -= v_off;
 
-  float inv_bus = 1.0f / bus_v;
-  SetPwmDuties(0.5f + v_u * inv_bus, 0.5f + v_v * inv_bus, 0.5f + v_w * inv_bus);
+    float inv_bus = 1.0f / bus_v;
+    float du = 0.5f + vu * inv_bus;
+    float dv = 0.5f + vv * inv_bus;
+    float dw = 0.5f + vw * inv_bus;
+
+    if (du < 0.0f) du = 0.0f; else if (du > 1.0f) du = 1.0f;
+    if (dv < 0.0f) dv = 0.0f; else if (dv > 1.0f) dv = 1.0f;
+    if (dw < 0.0f) dw = 0.0f; else if (dw > 1.0f) dw = 1.0f;
+
+    TIM1->CCR1 = (uint32_t)(du * (float)TIM1_ARR_VALUE);
+    TIM1->CCR2 = (uint32_t)(dv * (float)TIM1_ARR_VALUE);
+    TIM1->CCR3 = (uint32_t)(dw * (float)TIM1_ARR_VALUE);
 }
 
+/* ===== Encoder offset calibration ===== */
 static float CalibrateEncoderOffset(float bus_v)
 {
-  /* Phase 1: Apply current at electrical angle 0 to lock rotor */
-  printf("Aligning rotor to electrical zero...\r\n");
-  AlignRotorSVPWM(FOC_ALIGN_VOLTAGE, 0.0f, 0.0f, bus_v);
-  HAL_Delay(FOC_ALIGN_TIME_MS);
+    /* Apply d-axis voltage at electrical angle 0 to lock rotor */
+    AlignSVPWM(ALIGN_VOLTAGE_V, 0.0f, 0.0f, bus_v);
+    HAL_Delay(ALIGN_TIME_MS);
 
-  /* Phase 2: Read encoder angle at the locked position */
-  float sum_deg = 0.0f;
-  uint16_t raw;
-  float deg;
-  for (int i = 0; i < 16; i++)
-  {
-    A1333_ReadAngle15(&angle_sensor, &raw, &deg);
-    sum_deg += deg;
-    HAL_Delay(5);
-  }
-  float mech_at_zero_deg = sum_deg / 16.0f;
-  float mech_at_zero_rad = mech_at_zero_deg * (TWO_PI_F / 360.0f);
+    /* Average encoder readings at locked position */
+    float sum = 0.0f;
+    for (int i = 0; i < 16; i++) {
+        float angle;
+        Encoder_ReadAngle(&angle);
+        sum += angle;
+        HAL_Delay(5);
+    }
+    float mech_at_zero = sum / 16.0f;
 
-  /* The electrical angle at alignment is 0, so:
-     electrical_angle = (mechanical * pole_pairs) - offset = 0
-     offset = mechanical * pole_pairs (wrapped to [0, 2*pi]) */
-  float offset = mech_at_zero_rad * (float)FOC_POLE_PAIRS;
-  while (offset > TWO_PI_F) offset -= TWO_PI_F;
-  while (offset < 0.0f) offset += TWO_PI_F;
+    /* Electrical offset = mechanical * pole_pairs, wrapped to [0, 2pi) */
+    float offset = fmodf(mech_at_zero * (float)MOTOR_POLE_PAIRS, TWO_PI_F);
+    if (offset < 0.0f) offset += TWO_PI_F;
 
-  printf("Encoder offset: mech=%ld deg  offset=%ld mrad\r\n",
-         (int32_t)mech_at_zero_deg, (int32_t)(offset * 1000.0f));
+    UART_Printf("Encoder offset: mech=%.1fdeg elec=%.1fdeg\r\n",
+                 mech_at_zero * RAD_TO_DEG_F, offset * RAD_TO_DEG_F);
 
-  /* Ramp down alignment voltage */
-  for (int i = 10; i >= 0; i--)
-  {
-    float v = FOC_ALIGN_VOLTAGE * ((float)i / 10.0f);
-    AlignRotorSVPWM(v, 0.0f, 0.0f, bus_v);
-    HAL_Delay(20);
-  }
-  SetPwmDuties(0.5f, 0.5f, 0.5f);
+    /* Ramp down alignment voltage */
+    for (int i = 0; i < 22; i++) {
+        float v = ALIGN_VOLTAGE_V * (1.0f - (float)i / 22.0f);
+        AlignSVPWM(v, 0.0f, 0.0f, bus_v);
+        HAL_Delay(10);
+    }
 
-  return offset;
+    /* Zero voltage */
+    TIM1->CCR1 = TIM1_HALF_PERIOD;
+    TIM1->CCR2 = TIM1_HALF_PERIOD;
+    TIM1->CCR3 = TIM1_HALF_PERIOD;
+
+    return offset;
 }
 
-static void UART_SendDirect(const char *buf, uint16_t len)
+/* ===== Current zero calibration ===== */
+static void CalibrateCurrentZeros(void)
 {
-  for (uint16_t i = 0; i < len; i++)
-  {
-    while (!(USART1->ISR & USART_ISR_TXE));
-    USART1->TDR = (uint8_t)buf[i];
-  }
+    uint32_t sum_ia = 0, sum_ib = 0;
+    for (int i = 0; i < 500; i++) {
+        uint32_t raw = g_adc_dual_raw;
+        sum_ia += (raw & 0xFFFF);
+        sum_ib += (raw >> 16);
+        HAL_Delay(2);
+    }
+    g_ia_zero_counts = sum_ia / 500;
+    g_ib_zero_counts = sum_ib / 500;
+
+    UART_Printf("Current zeros: ia=%lu ib=%lu counts\r\n",
+                 (unsigned long)g_ia_zero_counts,
+                 (unsigned long)g_ib_zero_counts);
 }
 
-/* USER CODE END 0 */
+/* ===== Bus voltage non-blocking state machine ===== */
+typedef enum { BV_IDLE, BV_WAIT } BusV_State_t;
+static BusV_State_t s_bv_state = BV_IDLE;
+static float s_bv_filtered = 0.0f;
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
+static void BusVoltage_Update(void)
+{
+    switch (s_bv_state) {
+    case BV_IDLE:
+        /* Start injected conversion (avoid collision with TIM1 trigger) */
+        if (TIM1->CNT > 200 && TIM1->CNT < 1800) {
+            LL_ADC_INJ_StartConversion(ADC1);
+            s_bv_state = BV_WAIT;
+        }
+        break;
+
+    case BV_WAIT:
+        if (LL_ADC_IsActiveFlag_JEOS(ADC1)) {
+            LL_ADC_ClearFlag_JEOS(ADC1);
+            uint32_t raw = LL_ADC_INJ_ReadConversionData12(ADC1, LL_ADC_INJ_RANK_1);
+            float v = (float)raw * (float)g_vdda_mv
+                    / ((float)ADC_MAX_COUNTS * 1000.0f) * BUS_V_DIVIDER_RATIO;
+
+            /* Outlier rejection + low-pass filter */
+            if (s_bv_filtered == 0.0f) {
+                s_bv_filtered = v; /* First reading */
+            } else if (fabsf(v - s_bv_filtered) < BUS_V_OUTLIER_THRESH) {
+                s_bv_filtered += BUS_V_FILTER_ALPHA * (v - s_bv_filtered);
+            }
+            /* else: outlier, skip */
+
+            g_bus_voltage = s_bv_filtered;
+
+            /* Safety check */
+            if (s_bv_filtered > BUS_V_MAX) {
+                g_foc_enabled = 0;
+                g_fault_code = 2; /* overvoltage */
+            } else if (s_bv_filtered < BUS_V_MIN && s_bv_filtered > 1.0f) {
+                g_foc_enabled = 0;
+                g_fault_code = 3; /* undervoltage */
+            }
+
+            s_bv_state = BV_IDLE;
+        }
+        break;
+    }
+}
+
+/* ===== MAIN ===== */
 int main(void)
 {
+    /* 1. HAL init (SysTick only) */
+    HAL_Init();
 
-  /* USER CODE BEGIN 1 */
+    /* 2. System clock 170MHz */
+    LL_SystemClock_Init();
 
-  /* USER CODE END 1 */
+    /* Update HAL's SystemCoreClock for HAL_Delay */
+    SystemCoreClock = 170000000UL;
 
-  /* MCU Configuration--------------------------------------------------------*/
+    /* 3. All GPIO */
+    LL_GPIO_Init_All();
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+    /* 4. OPAMP3 (bus voltage buffer) */
+    LL_OPAMP3_Init();
 
-  /* USER CODE BEGIN Init */
+    /* 5. DMA for ADC */
+    LL_DMA_Init_ADC(&g_adc_dual_raw);
 
-  /* USER CODE END Init */
+    /* 6. ADC1+ADC2 dual mode */
+    LL_ADC_Init_All();
+    LL_ADC_Calibrate_All();
 
-  /* Configure the system clock */
-  SystemClock_Config();
+    /* 7. TIM1 PWM (counter starts, PWM channels enabled) */
+    LL_TIM1_Init();
 
-  /* USER CODE BEGIN SysInit */
+    /* 8. SPI3 for encoder */
+    LL_SPI3_Init();
 
-  /* USER CODE END SysInit */
+    /* 9. USART1 for telemetry */
+    LL_USART1_Init();
 
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_ADC1_Init();
-  MX_ADC2_Init();
-  MX_FDCAN1_Init();
-  MX_SPI1_Init();
-  MX_SPI3_Init();
-  MX_TIM1_Init();
-  MX_USART1_UART_Init();
-  MX_OPAMP3_Init();
-  /* USER CODE BEGIN 2 */
+    /* 10. FDCAN placeholder */
+    LL_FDCAN1_Init();
 
-  /* RX pin not connected — disable receiver entirely to prevent floating-pin noise.
-     All UART output uses direct register writes, no IRQ needed. */
-  CLEAR_BIT(USART1->CR1, USART_CR1_RE);
+    /* 11. Enable gate drivers */
+    LL_GPIO_SetOutputPin(GATE_EN1_PORT, GATE_EN1_PIN);
+    LL_GPIO_SetOutputPin(GATE_EN2_PORT, GATE_EN2_PIN);
+    LL_GPIO_SetOutputPin(GATE_EN3_PORT, GATE_EN3_PIN);
 
-  /* Enable UCC27302A gate driver (PC7, PC8, PC9) */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_SET);
+    /* 12. Software init */
+    FOC_Init();
+    FOC_SetGains(FOC_KP_D, FOC_KI_D, FOC_KP_Q, FOC_KI_Q);
+    FOC_SetCurrentRefs(0.0f, 0.0f);
 
-  UART_Send("Hello, Mako Shortfin!\n");
-  printf("Clock: %lu Hz\r\n", SystemCoreClock);
-  printf("=== ISR-Based FOC Control @ %u Hz ===\r\n", FOC_ISR_FREQ_HZ);
-  printf("Iq_ref=%ldmA  Id_ref=%ldmA  Poles=%u\r\n",
-         (int32_t)(FOC_IQ_REF_A * 1000.0f), (int32_t)(FOC_ID_REF_A * 1000.0f), FOC_POLE_PAIRS);
-  printf("Current PI: Kp=%ld Ki=%ld\r\n",
-         (int32_t)(FOC_KP_Q * 100.0f), (int32_t)FOC_KI_Q);
+    Encoder_Init();
+    Control_Init();
+    Control_SetGains(POS_KP, POS_KI, POS_KD);
+    UART_Init();
 
-  FOC_Init();
-  FOC_SetPolePairs(FOC_POLE_PAIRS);
-  FOC_SetControlPeriod(FOC_ISR_DT_SECONDS);
-  FOC_SetCurrentGains(FOC_KP_D, FOC_KI_D, FOC_KP_Q, FOC_KI_Q);
-  FOC_SetCurrentRefs(FOC_ID_REF_A, FOC_IQ_REF_A);
+    UART_Printf("\r\nMako Shortfin FOC v2.0\r\n");
+    UART_Printf("Clock: %lu MHz\r\n", (unsigned long)(SystemCoreClock / 1000000UL));
 
-  /* A1333 Encoder Init */
-  A1333_Status a1333_status = A1333_Init(&angle_sensor, &hspi3, A1333_CS_PORT, A1333_CS_PIN);
-  if (a1333_status != A1333_OK)
-  {
-    printf("A1333 init FAILED (%d)\r\n", a1333_status);
-  }
-  else
-  {
-    printf("A1333 init OK\r\n");
-    A1333_ClearErrors(&angle_sensor);
-    A1333_ClearWarnings(&angle_sensor);
+    /* 13. Calibrate VDDA */
+    LL_ADC_Start_All();
+    HAL_Delay(10);
+    CalibrateVDDA();
+    UART_Printf("VDDA: %lu mV\r\n", (unsigned long)g_vdda_mv);
 
-    bool valid = false;
-    for (int i = 0; i < 20 && !valid; i++)
-    {
-      A1333_IsAngleValid(&angle_sensor, &valid);
-      HAL_Delay(10);
-    }
-    uint16_t init_raw;
-    float init_deg;
-    A1333_ReadAngle15(&angle_sensor, &init_raw, &init_deg);
-  }
+    /* 14. Enable PWM outputs at 50% duty (zero voltage) */
+    TIM1->CCR1 = TIM1_HALF_PERIOD;
+    TIM1->CCR2 = TIM1_HALF_PERIOD;
+    TIM1->CCR3 = TIM1_HALF_PERIOD;
+    LL_TIM_EnableAllOutputs(TIM1);
 
-  /* Start OPAMP, calibrate ADCs */
-  if (HAL_OPAMP_Start(&hopamp3) != HAL_OK) Error_Handler();
-  if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK) Error_Handler();
-  if (HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED) != HAL_OK) Error_Handler();
+    /* 15. Read initial bus voltage */
+    float bus_v = ReadBusVoltageBlocking();
+    g_bus_voltage = bus_v;
+    s_bv_filtered = bus_v;
+    UART_Printf("Bus: %ld mV\r\n", (long)(bus_v * 1000.0f));
 
-  /* Measure true VDDA via VREFINT and update ADC scaling */
-  uint32_t vdda = MeasureVddaMv();
-  adc_vref_mv = vdda;
-  printf("VDDA: %lu mV (assumed %u mV)\r\n", vdda, ADC_VREF_MV);
+    /* 16. Encoder offset calibration */
+    g_encoder_offset = CalibrateEncoderOffset(bus_v);
 
-  /* Start dual-mode ADC DMA with timer trigger */
-  HAL_Delay(1);
-  if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)&adc_dual_raw, 1) != HAL_OK) {
-    printf("ERROR: ADC DMA start failed!\r\n");
-    Error_Handler();
-  }
+    /* 17. Current zero calibration (motor de-energized) */
+    HAL_Delay(500);
+    CalibrateCurrentZeros();
 
-  /* DMAEN needed: STM32G4 HAL multimode DMA relies on individual DMAEN */
-  SET_BIT(hadc1.Instance->CFGR, ADC_CFGR_DMAEN);
+    /* 18. Prepare FOC */
+    FOC_Reset();
+    FOC_SetCurrentRefs(0.0f, 0.0f);
 
-  /* Start TIM1 base + CH4 (ADC trigger) */
-  if (HAL_TIM_Base_Start(&htim1) != HAL_OK) Error_Handler();
-  if (HAL_TIM_OC_Start(&htim1, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
+    /* 19. Start watchdog */
+    LL_IWDG_Init();
 
-  /* Disable DMA interrupts (polling mode for ADC data) */
-  if (hadc1.DMA_Handle != NULL) {
-    __HAL_DMA_DISABLE_IT(hadc1.DMA_Handle, DMA_IT_TC | DMA_IT_HT | DMA_IT_TE);
-  }
+    /* 20. Enable FOC ISR */
+    NVIC_SetPriority(TIM1_UP_TIM16_IRQn, 0);
+    NVIC_EnableIRQ(TIM1_UP_TIM16_IRQn);
+    LL_TIM_EnableIT_UPDATE(TIM1);
+    g_foc_enabled = 1;
 
-  /* Read bus voltage (blocking OK during init, before ISR starts) */
-  float bus_v = ReadBusVoltageBlocking();
-  shared_bus_voltage = bus_v;
-  printf("Bus: %ld.%01ld V\r\n",
-         (int32_t)bus_v, (int32_t)((bus_v - (int32_t)bus_v) * 10.0f));
+    UART_Printf("FOC running @ %lu Hz\r\n", (unsigned long)FOC_ISR_FREQ_HZ);
 
-  /* Enable PWM outputs at 50% duty (zero voltage) */
-  SetPwmDuties(0.5f, 0.5f, 0.5f);
-  EnablePwmOutputs();
-  __HAL_TIM_MOE_ENABLE(&htim1);
+    /* ===== Main loop ===== */
+    uint32_t last_pos_ms = HAL_GetTick();
+    uint32_t last_telem_ms = HAL_GetTick();
+    uint32_t last_busv_ms = HAL_GetTick();
+    uint32_t last_switch_ms = HAL_GetTick();
+    uint8_t target_select = 0;
 
-  /* Calibrate encoder offset by aligning rotor to electrical zero */
-  encoder_offset_rad = CalibrateEncoderOffset(bus_v) + ENCODER_OFFSET_TRIM_RAD;
+    g_pos_target = POS_TARGET_A_DEG * DEG_TO_RAD_F;
+    Control_SetTarget(g_pos_target);
 
-  /* Encoder direction test: apply small Vq and check if angle increases */
-  {
-    uint16_t dir_raw;
-    float dir_deg_before, dir_deg_after;
-    A1333_ReadAngle15(&angle_sensor, &dir_raw, &dir_deg_before);
+    while (1) {
+        uint32_t now = HAL_GetTick();
 
-    /* Apply Vq=2V at electrical angle 0 (rotor just aligned there) */
-    AlignRotorSVPWM(0.0f, 2.0f, 0.0f, bus_v);
-    HAL_Delay(300);
-    A1333_ReadAngle15(&angle_sensor, &dir_raw, &dir_deg_after);
-    SetPwmDuties(0.5f, 0.5f, 0.5f);
+        /* Position control @ 1kHz */
+        if (now - last_pos_ms >= 1) {
+            float dt = (float)(now - last_pos_ms) * 0.001f;
+            last_pos_ms = now;
 
-    float delta = dir_deg_after - dir_deg_before;
-    /* Handle wraparound */
-    if (delta > 180.0f) delta -= 360.0f;
-    if (delta < -180.0f) delta += 360.0f;
-    printf("Encoder direction test: before=%ld after=%ld delta=%ld mdeg\r\n",
-           (int32_t)(dir_deg_before * 1000.0f),
-           (int32_t)(dir_deg_after * 1000.0f),
-           (int32_t)(delta * 1000.0f));
-    if (delta < 0.0f)
-    {
-      printf("  WARNING: Encoder may be inverted! (angle decreased with +Vq)\r\n");
-    }
-    else
-    {
-      printf("  OK: Encoder direction matches motor rotation\r\n");
-    }
-  }
+            /* Toggle target every POS_SWITCH_MS */
+            if (now - last_switch_ms >= POS_SWITCH_MS) {
+                last_switch_ms = now;
+                target_select ^= 1;
+                float tgt_deg = target_select ? POS_TARGET_B_DEG : POS_TARGET_A_DEG;
+                g_pos_target = tgt_deg * DEG_TO_RAD_F;
+                Control_SetTarget(g_pos_target);
+                Control_Reset();
+            }
 
-  /* Wait for alignment current to fully decay (motor is magnetically "sticky") */
-  HAL_Delay(1000);  /* Extended: ensure complete magnetic flux decay */
-
-  /* CRITICAL: Zero the current sensors AFTER alignment with averaging to reduce noise */
-  printf("Zeroing current sensors (averaging 200 samples)...\r\n");
-  uint32_t ia_sum = 0;
-  uint32_t ib_sum = 0;
-  for (int i = 0; i < 200; i++)
-  {
-    uint32_t raw = adc_dual_raw;
-    uint16_t ia_raw = (uint16_t)(raw & 0xFFFF);
-    uint16_t ib_raw = (uint16_t)(raw >> 16);
-    ia_sum += AdcCountsToMv(ia_raw);
-    ib_sum += AdcCountsToMv(ib_raw);
-    HAL_Delay(5);  /* 5ms between samples = 1 second total */
-  }
-  ia_zero_mv = ia_sum / 200;
-  ib_zero_mv = ib_sum / 200;
-  printf("ADC zeroed (post-alignment): Ia=%lu mV, Ib=%lu mV\r\n", ia_zero_mv, ib_zero_mv);
-
-  /* Reset PI integrators after alignment (keeps all config intact) */
-  FOC_ResetIntegrators();
-
-  /* Set Iq=0 before enabling ISR — position loop will command torque */
-  FOC_SetCurrentRefs(FOC_ID_REF_A, 0.0f);
-
-  /* Set initial shared state */
-  shared_electrical_angle = 0.0f;
-
-  /* Print all status messages BEFORE enabling ISR (printf is too slow under ISR preemption) */
-  printf("FOC ISR starting @ %u Hz\r\n", FOC_ISR_FREQ_HZ);
-
-  /* Start IWDG watchdog (~1s timeout) */
-  IWDG->KR  = 0x5555U;   /* Unlock registers */
-  IWDG->PR  = 4U;         /* Prescaler /64 -> 40kHz/64 = 625Hz */
-  IWDG->RLR = 625U;       /* Reload -> ~1s timeout */
-  IWDG->KR  = 0xCCCCU;    /* Start watchdog */
-  printf("IWDG watchdog started (~1s timeout)\r\n");
-
-  printf("Safety: OC=25A, Bus=[%ld-%ldV]\r\n\r\n",
-         (int32_t)MIN_BUS_VOLTAGE, (int32_t)MAX_BUS_VOLTAGE);
-
-  uint32_t last_print_ms = HAL_GetTick();
-
-  /* Position control state */
-  float pos_target_rad = POS_TARGET_A_DEG * (TWO_PI_F / 360.0f);
-  float pos_last_error = 0.0f;
-  float pos_integrator = 0.0f;
-  uint32_t pos_last_ms = HAL_GetTick();
-  uint32_t pos_switch_ms = HAL_GetTick();
-  uint8_t pos_target_idx = 0;  /* 0=A, 1=B */
-
-  printf("Position control: toggling %ld<->%ld deg every %ums\r\n",
-         (int32_t)POS_TARGET_A_DEG, (int32_t)POS_TARGET_B_DEG, POS_SWITCH_MS);
-
-  /* Fix RCR: center-aligned mode decrements RCR on BOTH overflow and underflow.
-   * ARR=2125 → 40kHz triangle → 80kHz events. RCR=3 → UEV every 4 events = 20kHz.
-   * (CubeMX had RCR=1 which gives 40kHz, exceeding ISR budget of ~28us) */
-  __HAL_TIM_SET_AUTORELOAD(&htim1, 2125);  /* Ensure ARR is correct */
-  htim1.Instance->RCR = 3U;
-  htim1.Instance->EGR = TIM_EGR_UG;  /* Force update to load RCR shadow register */
-  __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);  /* Clear UIF from EGR write */
-
-  /* Enable TIM1 Update interrupt (FOC ISR at 20 kHz) */
-  HAL_NVIC_SetPriority(TIM1_UP_TIM16_IRQn, 0, 0);  /* Highest priority */
-  HAL_NVIC_EnableIRQ(TIM1_UP_TIM16_IRQn);
-  __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
-
-  /* Start FOC processing in ISR */
-  foc_isr_enabled = 1;
-
-  /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
-    /* USER CODE BEGIN 3 */
-    uint32_t now = HAL_GetTick();
-
-    /* --- Task 1: Non-blocking bus voltage state machine --- */
-    {
-      static enum { BV_IDLE, BV_WAIT } bv_state = BV_IDLE;
-      static uint32_t bv_last_ms = 0;
-
-      if (bv_state == BV_IDLE && (now - bv_last_ms) >= BUS_V_UPDATE_MS)
-      {
-        /* Only start injected when TIM1 counter is far from ADC trigger (CH4=2832) and ISR (cnt=0) */
-        uint32_t cnt = __HAL_TIM_GET_COUNTER(&htim1);
-        if (cnt > 200U && cnt < 1800U)
-        {
-          HAL_ADCEx_InjectedStart(&hadc1);
-          bv_state = BV_WAIT;
+            float iq_cmd = Control_Update(g_mech_angle, dt);
+            g_iq_ref = iq_cmd;
+            FOC_SetCurrentRefs(0.0f, iq_cmd);
         }
-      }
-      if (bv_state == BV_WAIT)
-      {
-        if (__HAL_ADC_GET_FLAG(&hadc1, ADC_FLAG_JEOS))
-        {
-          uint32_t raw = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1);
-          HAL_ADCEx_InjectedStop(&hadc1);
-          __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_JEOS | ADC_FLAG_JEOC);
 
-          float v = ((float)AdcCountsToMv(raw) / 1000.0f) * BUS_VOLTAGE_DIVIDER_RATIO;
-
-          /* Reject spurious readings: if previous reading exists and new
-             reading jumps more than 2V, discard it (ADC timing glitch) */
-          static float bv_filtered = 0.0f;
-          if (bv_filtered < 1.0f)
-            bv_filtered = shared_bus_voltage;  /* Seed from blocking read */
-
-          if (v > (bv_filtered + 2.0f) || v < (bv_filtered - 2.0f))
-            v = bv_filtered;  /* Reject outlier, keep previous */
-          else
-            bv_filtered = bv_filtered * 0.8f + v * 0.2f;  /* Low-pass filter */
-
-          __disable_irq();
-          shared_bus_voltage = bv_filtered;
-          __enable_irq();
-
-          /* Bus voltage window check */
-          if (foc_isr_enabled && (v > MAX_BUS_VOLTAGE || v < MIN_BUS_VOLTAGE))
-          {
-            foc_isr_enabled = 0;
-            foc_fault_code = (v > MAX_BUS_VOLTAGE) ? 2 : 3;
-          }
-
-          bv_state = BV_IDLE;
-          bv_last_ms = now;
+        /* Bus voltage @ periodic */
+        if (now - last_busv_ms >= BUS_V_UPDATE_MS) {
+            last_busv_ms = now;
+            BusVoltage_Update();
         }
-      }
+        /* Also check if conversion is pending */
+        if (s_bv_state == BV_WAIT) {
+            BusVoltage_Update();
+        }
+
+        /* Telemetry @ 50Hz */
+        if (now - last_telem_ms >= TELEMETRY_PERIOD_MS) {
+            last_telem_ms = now;
+            UART_SendTelemetry();
+        }
+
+        /* Watchdog refresh */
+        IWDG->KR = 0xAAAA;
     }
-
-    /* --- Task 2: Refresh watchdog --- */
-    IWDG->KR = 0xAAAAU;
-
-    /* --- Task 3: Position control loop every 1ms --- */
-    if (foc_isr_enabled && (now - pos_last_ms) >= POS_LOOP_MS)
-    {
-      float dt = (float)(now - pos_last_ms) * 0.001f;
-      pos_last_ms = now;
-
-      /* Toggle target every POS_SWITCH_MS */
-      if ((now - pos_switch_ms) >= POS_SWITCH_MS)
-      {
-        pos_switch_ms = now;
-        pos_target_idx ^= 1;
-        pos_target_rad = pos_target_idx
-          ? POS_TARGET_B_DEG * (TWO_PI_F / 360.0f)
-          : POS_TARGET_A_DEG * (TWO_PI_F / 360.0f);
-        pos_integrator = 0.0f;  /* Reset integrator on target change */
-      }
-
-      /* Read mechanical angle from ISR */
-      float mech = shared_mechanical_angle;
-
-      /* Position error with shortest-path wraparound */
-      float error = pos_target_rad - mech;
-      if (error > 3.14159265f) error -= TWO_PI_F;
-      if (error < -3.14159265f) error += TWO_PI_F;
-
-      /* PID controller */
-      pos_integrator += error * dt;
-      /* Anti-windup clamp */
-      if (pos_integrator > POS_KI_LIMIT / POS_KI) pos_integrator = POS_KI_LIMIT / POS_KI;
-      if (pos_integrator < -POS_KI_LIMIT / POS_KI) pos_integrator = -POS_KI_LIMIT / POS_KI;
-      float d_error = (error - pos_last_error) / dt;
-      pos_last_error = error;
-      float iq_cmd = -(POS_KP * error + POS_KI * pos_integrator + POS_KD * d_error);
-
-      /* Clamp iq command */
-      if (iq_cmd > POS_IQ_LIMIT) iq_cmd = POS_IQ_LIMIT;
-      if (iq_cmd < -POS_IQ_LIMIT) iq_cmd = -POS_IQ_LIMIT;
-
-      shared_iq_ref = iq_cmd;
-      FOC_SetCurrentRefs(FOC_ID_REF_A, iq_cmd);
-    }
-
-    /* --- Task 4: Non-blocking telemetry every 20ms --- */
-    if ((now - last_print_ms) >= 20U)
-    {
-      last_print_ms = now;
-
-      /* Read ISR profiling data */
-      uint32_t isr_cnt = foc_isr_count;
-      uint32_t max_cyc = foc_isr_max_cycles;
-      float max_us = (float)max_cyc / 170.0f;  /* 170 MHz -> cycles to us */
-
-      int32_t el_deg = (int32_t)(shared_electrical_angle * 57.2957795f);
-      int32_t bus_mv = (int32_t)(shared_bus_voltage * 1000.0f);
-      float id_m = shared_id_measured;
-      float iq_m = shared_iq_measured;
-      float vd_out = shared_vd;
-      float vq_out = shared_vq;
-
-      /* Convert floats to integers for printf (newlib-nano doesn't support %f) */
-      int32_t id_ma = (int32_t)(id_m * 1000.0f);
-      int32_t iq_ma = (int32_t)(iq_m * 1000.0f);
-      int32_t vd_mv = (int32_t)(vd_out * 1000.0f);
-      int32_t vq_mv = (int32_t)(vq_out * 1000.0f);
-      int32_t max_us_int = (int32_t)max_us;
-
-      int len;
-      if (foc_fault_code)
-      {
-        static const char *fault_names[] = {
-          "none", "OVERCURRENT", "OVERVOLTAGE", "UNDERVOLTAGE", "USER_KILL"
-        };
-        const char *fname = (foc_fault_code <= 4) ? fault_names[foc_fault_code] : "UNKNOWN";
-        len = snprintf(uart_tx_buf, UART_TX_BUF_SIZE,
-               "FAULT:%s Bus:%ld.%01ldV id:%ldmA iq:%ldmA\r\n",
-               fname,
-               bus_mv / 1000, (bus_mv % 1000) / 100,
-               id_ma, iq_ma);
-      }
-      else
-      {
-        int32_t mech_mdeg = (int32_t)(shared_mechanical_angle * 57295.7795f);  /* mrad -> mdeg */
-        int32_t tgt_mdeg = (int32_t)(pos_target_rad * 57295.7795f);
-        int32_t iq_ref_ma = (int32_t)(shared_iq_ref * 1000.0f);
-        len = snprintf(uart_tx_buf, UART_TX_BUF_SIZE,
-               "pos:%ld>%lddeg ref:%ldmA iq:%ldmA id:%ldmA Bus:%ld.%01ldV %ldus\r\n",
-               mech_mdeg / 1000, tgt_mdeg / 1000,
-               iq_ref_ma, iq_ma, id_ma,
-               bus_mv / 1000, (bus_mv % 1000) / 100,
-               max_us_int);
-      }
-      if (len > 0) UART_SendDirect(uart_tx_buf, (uint16_t)len);
-
-      foc_isr_count = 0;       /* Reset count for next telemetry period */
-      foc_isr_max_cycles = 0;  /* Reset peak tracker */
-    }
-  }
-  /* USER CODE END 3 */
 }
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
+/* ===== System Clock Config (HAL compatibility - called by HAL_Init) ===== */
 void SystemClock_Config(void)
 {
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  /** Configure the main internal regulator output voltage
-  */
-  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
-
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
-  RCC_OscInitStruct.PLL.PLLN = 85;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
-  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();  
-  }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
-  {
-    Error_Handler();
-  }
+    /* Clock is configured by LL_SystemClock_Init() instead */
 }
 
-/* USER CODE BEGIN 4 */
-
-/* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
+    __disable_irq();
+    while (1) {}
 }
-#ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */

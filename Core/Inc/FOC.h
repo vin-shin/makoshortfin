@@ -1,48 +1,30 @@
-#ifndef __FOC_H__
-#define __FOC_H__
+#ifndef FOC_H
+#define FOC_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <stdint.h>
 
-#include "main.h"
+typedef struct {
+    float ia;
+    float ib;
+    float bus_v;
+    float elec_angle;
+} FOC_Sensors_t;
 
-typedef struct
-{
-  float ia;
-  float ib;
-  float ic;
-  float bus_v;
-  float electrical_angle;
-} FOC_SensorData;
-
-typedef struct
-{
-  float id_ref;
-  float iq_ref;
-  float id_measured;
-  float iq_measured;
-  float vd;
-  float vq;
-  float duty_u;
-  float duty_v;
-  float duty_w;
-} FOC_Output;
+typedef struct {
+    float id_meas;
+    float iq_meas;
+    float vd;
+    float vq;
+    float duty_u;
+    float duty_v;
+    float duty_w;
+} FOC_Output_t;
 
 void FOC_Init(void);
 void FOC_Reset(void);
-void FOC_ResetIntegrators(void);
-void FOC_SetPolePairs(uint16_t pole_pairs);
-void FOC_SetCurrentOffsets(float ia_offset, float ib_offset, float ic_offset);
 void FOC_SetCurrentRefs(float id_ref, float iq_ref);
-void FOC_SetCurrentGains(float kp_d, float ki_d, float kp_q, float ki_q);
-void FOC_SetControlPeriod(float dt_seconds);
-void FOC_UpdateSensors(const FOC_SensorData *data);
-void FOC_Run(FOC_Output *out);
-void FOC_SinCos(float angle, float *sin_out, float *cos_out);
+void FOC_SetGains(float kp_d, float ki_d, float kp_q, float ki_q);
+void FOC_Run(const FOC_Sensors_t *sensors, FOC_Output_t *output);
+void FOC_SinCos(float angle_rad, float *sin_out, float *cos_out);
 
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* __FOC_H__ */
+#endif /* FOC_H */

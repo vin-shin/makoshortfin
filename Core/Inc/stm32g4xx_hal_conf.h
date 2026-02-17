@@ -22,6 +22,11 @@
 #ifndef STM32G4xx_HAL_CONF_H
 #define STM32G4xx_HAL_CONF_H
 
+/* Enable LL drivers */
+#ifndef USE_FULL_LL_DRIVER
+#define USE_FULL_LL_DRIVER
+#endif
+
 #ifdef __cplusplus
  extern "C" {
 #endif
