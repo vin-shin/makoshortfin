@@ -8,9 +8,10 @@
 #include <math.h>
 
 /* Shared state (defined in main.c) */
-extern volatile uint32_t g_adc_dual_raw;
+extern volatile uint32_t g_adc_dual_raw[2];
 extern volatile uint32_t g_ia_zero_counts;
 extern volatile uint32_t g_ib_zero_counts;
+extern volatile uint32_t g_ic_zero_counts;
 extern volatile uint32_t g_vdda_mv;
 extern volatile float g_bus_voltage;
 extern volatile uint8_t g_foc_enabled;
@@ -29,7 +30,12 @@ extern float g_encoder_offset;
 /* ISR-local filter state */
 static float s_ia_f1 = 0.0f, s_ia_f2 = 0.0f;
 static float s_ib_f1 = 0.0f, s_ib_f2 = 0.0f;
+static float s_ic_f1 = 0.0f, s_ic_f2 = 0.0f;
 static uint8_t s_spi_fail_count = 0;
+static float s_elec_angle_prev = 0.0f;
+static float s_elec_speed_f = 0.0f;
+static uint8_t s_elec_speed_valid = 0;
+
 
 /* ===== Cortex-M4 exception handlers ===== */
 
@@ -70,22 +76,31 @@ void TIM1_UP_TIM16_IRQHandler(void)
     uint32_t cyc_start = SysTick->VAL;
 
     /* 1. Read ADC dual-mode DMA buffer */
-    uint32_t adc_raw = g_adc_dual_raw;
-    uint16_t ia_counts = (uint16_t)(adc_raw & 0xFFFF);
-    uint16_t ib_counts = (uint16_t)(adc_raw >> 16);
+    uint32_t adc_raw0 = g_adc_dual_raw[0];
+    uint32_t adc_raw1 = g_adc_dual_raw[1];
+    uint16_t ia_counts1 = (uint16_t)(adc_raw0 & 0xFFFF);
+    uint16_t ib_counts = (uint16_t)(adc_raw0 >> 16);
+    uint16_t ia_counts2 = (uint16_t)(adc_raw1 & 0xFFFF);
+    uint16_t ic_counts = (uint16_t)(adc_raw1 >> 16);
+    uint16_t ia_counts = (uint16_t)(((uint32_t)ia_counts1 + (uint32_t)ia_counts2) / 2U);
 
     /* Convert counts -> amps */
     float ia_mv = (float)ia_counts * (float)g_vdda_mv / (float)ADC_MAX_COUNTS;
     float ib_mv = (float)ib_counts * (float)g_vdda_mv / (float)ADC_MAX_COUNTS;
     float ia_zero = (float)g_ia_zero_counts * (float)g_vdda_mv / (float)ADC_MAX_COUNTS;
     float ib_zero = (float)g_ib_zero_counts * (float)g_vdda_mv / (float)ADC_MAX_COUNTS;
+    float ic_zero = (float)g_ic_zero_counts * (float)g_vdda_mv / (float)ADC_MAX_COUNTS;
 
 #if INVERT_CURRENT_POLARITY
     float ia_raw = -((ia_mv - ia_zero) / CURRENT_SENSE_MV_PER_A);
     float ib_raw = -((ib_mv - ib_zero) / CURRENT_SENSE_MV_PER_A);
+    float ic_raw = -(((float)ic_counts * (float)g_vdda_mv / (float)ADC_MAX_COUNTS - ic_zero)
+                     / CURRENT_SENSE_MV_PER_A);
 #else
     float ia_raw = (ia_mv - ia_zero) / CURRENT_SENSE_MV_PER_A;
     float ib_raw = (ib_mv - ib_zero) / CURRENT_SENSE_MV_PER_A;
+    float ic_raw = (((float)ic_counts * (float)g_vdda_mv / (float)ADC_MAX_COUNTS - ic_zero)
+                    / CURRENT_SENSE_MV_PER_A);
 #endif
 
     /* 2nd-order IIR filter (two cascaded 1st-order stages) */
@@ -93,12 +108,16 @@ void TIM1_UP_TIM16_IRQHandler(void)
     s_ia_f2 += CURRENT_FILTER_ALPHA * (s_ia_f1 - s_ia_f2);
     s_ib_f1 += CURRENT_FILTER_ALPHA * (ib_raw - s_ib_f1);
     s_ib_f2 += CURRENT_FILTER_ALPHA * (s_ib_f1 - s_ib_f2);
+    s_ic_f1 += CURRENT_FILTER_ALPHA * (ic_raw - s_ic_f1);
+    s_ic_f2 += CURRENT_FILTER_ALPHA * (s_ic_f1 - s_ic_f2);
 
     float ia = s_ia_f2;
     float ib = s_ib_f2;
+    float ic = s_ic_f2;
 
     /* 2. Overcurrent protection */
-    if (fabsf(ia) > OVERCURRENT_LIMIT_A || fabsf(ib) > OVERCURRENT_LIMIT_A) {
+    if (fabsf(ia) > OVERCURRENT_LIMIT_A || fabsf(ib) > OVERCURRENT_LIMIT_A
+        || fabsf(ic) > OVERCURRENT_LIMIT_A) {
         g_foc_enabled = 0;
         g_fault_code = 1;
         TIM1->CCR1 = TIM1_HALF_PERIOD;
@@ -126,18 +145,39 @@ void TIM1_UP_TIM16_IRQHandler(void)
     }
 
     /* Compute electrical angle */
-    float elec_angle = fmodf(mech_angle * (float)MOTOR_POLE_PAIRS, TWO_PI_F) - g_encoder_offset;
-    if (elec_angle < 0.0f) elec_angle += TWO_PI_F;
+    float elec_angle = mech_angle * (float)MOTOR_POLE_PAIRS - g_encoder_offset;
+    elec_angle = FOC_WrapAngle2Pi(elec_angle);
+
+    if (s_elec_speed_valid) {
+        float delta = FOC_WrapAnglePi(elec_angle - s_elec_angle_prev);
+        float speed = delta / FOC_ISR_DT_S;
+        s_elec_speed_f += FOC_ANGLE_SPEED_ALPHA * (speed - s_elec_speed_f);
+    } else {
+        s_elec_speed_f = 0.0f;
+        s_elec_speed_valid = 1U;
+    }
+    s_elec_angle_prev = elec_angle;
 
     g_mech_angle = mech_angle;
     g_elec_angle = elec_angle;
+
+    float elec_angle_used = elec_angle;
+#if FOC_ANGLE_PREDICT_ENABLE
+    if (fabsf(s_elec_speed_f) >= FOC_ANGLE_PREDICT_MIN_SPEED_RAD_S) {
+        float lead = s_elec_speed_f * FOC_ANGLE_PREDICT_DELAY_S;
+        if (lead > FOC_ANGLE_PREDICT_MAX_RAD) lead = FOC_ANGLE_PREDICT_MAX_RAD;
+        if (lead < -FOC_ANGLE_PREDICT_MAX_RAD) lead = -FOC_ANGLE_PREDICT_MAX_RAD;
+        elec_angle_used = FOC_WrapAngle2Pi(elec_angle + lead);
+    }
+#endif
 
     /* 4. Run FOC */
     FOC_Sensors_t sensors = {
         .ia = ia,
         .ib = ib,
+        .ic = ic,
         .bus_v = g_bus_voltage,
-        .elec_angle = elec_angle,
+        .elec_angle = elec_angle_used,
     };
 
     FOC_Output_t foc_out;

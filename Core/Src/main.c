@@ -11,11 +11,12 @@
 /* ===== Global shared state ===== */
 
 /* ADC DMA destination (written by DMA, read by ISR) */
-volatile uint32_t g_adc_dual_raw = 0;
+volatile uint32_t g_adc_dual_raw[2] = {0, 0};
 
 /* Current zero calibration */
 volatile uint32_t g_ia_zero_counts = 2048;
 volatile uint32_t g_ib_zero_counts = 2048;
+volatile uint32_t g_ic_zero_counts = 2048;
 
 /* Calibrated VDDA in millivolts */
 volatile uint32_t g_vdda_mv = ADC_VREF_NOM_MV;
@@ -177,19 +178,27 @@ static float CalibrateEncoderOffset(float bus_v)
 /* ===== Current zero calibration ===== */
 static void CalibrateCurrentZeros(void)
 {
-    uint32_t sum_ia = 0, sum_ib = 0;
+    uint32_t sum_ia = 0, sum_ib = 0, sum_ic = 0;
     for (int i = 0; i < 500; i++) {
-        uint32_t raw = g_adc_dual_raw;
-        sum_ia += (raw & 0xFFFF);
-        sum_ib += (raw >> 16);
+        uint32_t raw0 = g_adc_dual_raw[0];
+        uint32_t raw1 = g_adc_dual_raw[1];
+        uint16_t ia1 = (uint16_t)(raw0 & 0xFFFF);
+        uint16_t ia2 = (uint16_t)(raw1 & 0xFFFF);
+        uint16_t ib = (uint16_t)(raw0 >> 16);
+        uint16_t ic = (uint16_t)(raw1 >> 16);
+        sum_ia += (uint32_t)(ia1 + ia2) / 2U;
+        sum_ib += ib;
+        sum_ic += ic;
         HAL_Delay(2);
     }
     g_ia_zero_counts = sum_ia / 500;
     g_ib_zero_counts = sum_ib / 500;
+    g_ic_zero_counts = sum_ic / 500;
 
-    UART_Printf("Current zeros: ia=%lu ib=%lu counts\r\n",
+    UART_Printf("Current zeros: ia=%lu ib=%lu ic=%lu counts\r\n",
                  (unsigned long)g_ia_zero_counts,
-                 (unsigned long)g_ib_zero_counts);
+                 (unsigned long)g_ib_zero_counts,
+                 (unsigned long)g_ic_zero_counts);
 }
 
 /* ===== Bus voltage non-blocking state machine ===== */
@@ -259,7 +268,7 @@ int main(void)
     LL_OPAMP3_Init();
 
     /* 5. DMA for ADC */
-    LL_DMA_Init_ADC(&g_adc_dual_raw);
+    LL_DMA_Init_ADC(g_adc_dual_raw);
 
     /* 6. ADC1+ADC2 dual mode */
     LL_ADC_Init_All();

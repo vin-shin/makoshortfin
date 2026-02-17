@@ -80,6 +80,7 @@ void FOC_Run(const FOC_Sensors_t *sensors, FOC_Output_t *output)
 {
     float ia = sensors->ia;
     float ib = sensors->ib;
+    float ic = sensors->ic;
     float bus_v = sensors->bus_v;
 
     /* Safety: zero output if bus voltage invalid */
@@ -97,6 +98,11 @@ void FOC_Run(const FOC_Sensors_t *sensors, FOC_Output_t *output)
     /* Sin/cos of electrical angle via CORDIC */
     float sin_e, cos_e;
     FOC_SinCos(sensors->elec_angle, &sin_e, &cos_e);
+
+    float i_sum = (ia + ib + ic) * (1.0f / 3.0f);
+    ia -= i_sum;
+    ib -= i_sum;
+    ic -= i_sum;
 
     /* Clarke transform: 3-phase -> alpha-beta */
     float i_alpha = ia;

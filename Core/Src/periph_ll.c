@@ -86,9 +86,10 @@ void LL_GPIO_Init_All(void)
     /* PB15: TIM1_CH3N AF4 on G474 */
     gpio_pin_config(GPIOB, 15, 2, 0, 3, 0, 4);  /* PB15 TIM1_CH3N */
 
-    /* --- ADC analog inputs: PA0 (ADC1_IN1), PA6 (ADC2_IN3) --- */
+    /* --- ADC analog inputs: PA0 (ADC1_IN1), PA6 (ADC2_IN3), PA7 (ADC2_IN4) --- */
     gpio_pin_config(GPIOA, 0, 3, 0, 0, 0, 0);   /* PA0 analog */
     gpio_pin_config(GPIOA, 6, 3, 0, 0, 0, 0);   /* PA6 analog */
+    gpio_pin_config(GPIOA, 7, 3, 0, 0, 0, 0);   /* PA7 analog */
 
     /* --- OPAMP3: PB0 (VINP), PB1 (VOUT) analog --- */
     gpio_pin_config(GPIOB, 0, 3, 0, 0, 0, 0);   /* PB0 analog */
@@ -190,7 +191,7 @@ void LL_DMA_Init_ADC(volatile uint32_t *dest)
     LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MEMORY_NOINCREMENT);
     LL_DMA_SetPeriphSize(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PDATAALIGN_WORD);
     LL_DMA_SetMemorySize(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MDATAALIGN_WORD);
-    LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_1, 1);
+    LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_1, 2);
 
     /* Addresses: source = ADC12_COMMON->CDR, dest = g_adc_dual_raw */
     LL_DMA_ConfigAddresses(DMA1, LL_DMA_CHANNEL_1,
@@ -222,13 +223,14 @@ void LL_ADC_Init_All(void)
     LL_ADC_ConfigOverSamplingRatioShift(ADC1, LL_ADC_OVS_RATIO_16,
                                          LL_ADC_OVS_SHIFT_RIGHT_4);
 
-    /* Regular channel config: single conversion, TIM1_TRGO2 trigger */
+    /* Regular channel config: 2 conversions, TIM1_TRGO2 trigger */
     LL_ADC_REG_SetTriggerSource(ADC1, LL_ADC_REG_TRIG_EXT_TIM1_TRGO2);
     LL_ADC_REG_SetTriggerEdge(ADC1, LL_ADC_REG_TRIG_EXT_RISING);
     LL_ADC_REG_SetContinuousMode(ADC1, LL_ADC_REG_CONV_SINGLE);
     LL_ADC_REG_SetDMATransfer(ADC1, LL_ADC_REG_DMA_TRANSFER_UNLIMITED);
-    LL_ADC_REG_SetSequencerLength(ADC1, LL_ADC_REG_SEQ_SCAN_DISABLE);
+    LL_ADC_REG_SetSequencerLength(ADC1, LL_ADC_REG_SEQ_SCAN_ENABLE_2RANKS);
     LL_ADC_REG_SetSequencerRanks(ADC1, LL_ADC_REG_RANK_1, LL_ADC_CHANNEL_1);
+    LL_ADC_REG_SetSequencerRanks(ADC1, LL_ADC_REG_RANK_2, LL_ADC_CHANNEL_1);
     LL_ADC_SetChannelSamplingTime(ADC1, LL_ADC_CHANNEL_1,
                                    LL_ADC_SAMPLINGTIME_12CYCLES_5);
 
@@ -246,10 +248,13 @@ void LL_ADC_Init_All(void)
     LL_ADC_ConfigOverSamplingRatioShift(ADC2, LL_ADC_OVS_RATIO_16,
                                          LL_ADC_OVS_SHIFT_RIGHT_4);
 
-    /* ADC2 regular: CH3 (PA6), slave in dual mode */
-    LL_ADC_REG_SetSequencerLength(ADC2, LL_ADC_REG_SEQ_SCAN_DISABLE);
+    /* ADC2 regular: CH3 (PA6), CH4 (PA7), slave in dual mode */
+    LL_ADC_REG_SetSequencerLength(ADC2, LL_ADC_REG_SEQ_SCAN_ENABLE_2RANKS);
     LL_ADC_REG_SetSequencerRanks(ADC2, LL_ADC_REG_RANK_1, LL_ADC_CHANNEL_3);
+    LL_ADC_REG_SetSequencerRanks(ADC2, LL_ADC_REG_RANK_2, LL_ADC_CHANNEL_4);
     LL_ADC_SetChannelSamplingTime(ADC2, LL_ADC_CHANNEL_3,
+                                   LL_ADC_SAMPLINGTIME_12CYCLES_5);
+    LL_ADC_SetChannelSamplingTime(ADC2, LL_ADC_CHANNEL_4,
                                    LL_ADC_SAMPLINGTIME_12CYCLES_5);
 }
 

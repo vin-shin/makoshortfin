@@ -3,22 +3,29 @@
 
 /* ===== Motor Parameters ===== */
 #define MOTOR_POLE_PAIRS        20U
-#define MOTOR_MAX_CURRENT_A     8.0f
-#define MOTOR_RATED_CURRENT_A   3.0f
+#define MOTOR_MAX_CURRENT_A     10.0f
+#define MOTOR_RATED_CURRENT_A   15.0f
 
 /* ===== FOC Timing ===== */
 #define FOC_ISR_FREQ_HZ         20000U
 #define FOC_ISR_DT_S            (1.0f / (float)FOC_ISR_FREQ_HZ)
 #define TIM1_ARR_VALUE          2125U
 #define TIM1_HALF_PERIOD        1062U
-#define TIM1_DEADTIME           38U     /* ~223ns @ 170MHz */
+#define TIM1_DEADTIME           25U     /* 1 tick = ~5.88 ns. 25 ticks = 147ns */
 #define TIM1_RCR_VALUE          3U      /* Update every 4th event = 20kHz */
 
+/* ===== Angle Prediction ===== */
+#define FOC_ANGLE_PREDICT_ENABLE        1
+#define FOC_ANGLE_PREDICT_DELAY_S       (0.6f * FOC_ISR_DT_S)
+#define FOC_ANGLE_PREDICT_MAX_RAD       0.52359878f  /* 30 deg */
+#define FOC_ANGLE_PREDICT_MIN_SPEED_RAD_S 5.0f
+#define FOC_ANGLE_SPEED_ALPHA           0.2f
+
 /* ===== Current Loop PI Gains ===== */
-#define FOC_KP_D                0.25f
-#define FOC_KI_D                2.0f
-#define FOC_KP_Q                0.25f
-#define FOC_KI_Q                2.0f
+#define FOC_KP_D                0.0229f
+#define FOC_KI_D                77.5f
+#define FOC_KP_Q                0.0229f
+#define FOC_KI_Q                77.5f
 
 /* ===== Position Loop PID Gains ===== */
 #define POS_KP                  0.5f
@@ -55,7 +62,7 @@
 #define SPI_MAX_FAILS           5U
 
 /* ===== Rotor Alignment ===== */
-#define ALIGN_VOLTAGE_V         6.0f
+#define ALIGN_VOLTAGE_V         1.0f
 #define ALIGN_TIME_MS           1000U
 #define ALIGN_RAMPDOWN_MS       220U
 
@@ -92,6 +99,8 @@
 #define ISENSE_A_PIN            LL_GPIO_PIN_0   /* ADC1_IN1 */
 #define ISENSE_B_PORT           GPIOA
 #define ISENSE_B_PIN            LL_GPIO_PIN_6   /* ADC2_IN3 */
+#define ISENSE_C_PORT           GPIOA
+#define ISENSE_C_PIN            LL_GPIO_PIN_7   /* ADC2_IN4 */
 
 /* OPAMP3 bus voltage */
 #define VBUS_INP_PORT           GPIOB
