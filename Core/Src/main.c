@@ -65,15 +65,15 @@
 /* FOC control parameters */
 #define FOC_IQ_REF_A      3.0f       /* Target q-axis current - below saturation for headroom */
 #define FOC_ID_REF_A      0.0f       /* Target d-axis current (0 for position control) */
-#define FOC_KP_D          0.25f      /* D-axis PI controller Kp */
-#define FOC_KI_D          2.0f       /* D-axis PI controller Ki */
-#define FOC_KP_Q          0.25f      /* Q-axis PI controller Kp */
-#define FOC_KI_Q          2.0f       /* Q-axis PI controller Ki */
+#define FOC_KP_D          0.12f      /* D-axis PI controller Kp */
+#define FOC_KI_D          87.5f       /* D-axis PI controller Ki */
+#define FOC_KP_Q          0.12f      /* Q-axis PI controller Kp */
+#define FOC_KI_Q          87.5f       /* Q-axis PI controller Ki */
 #define TIM1_PERIOD       2125U      /* TIM1 ARR value (center-aligned: 170MHz / 2*2125 = 40 kHz) */
 #define FOC_ISR_FREQ_HZ   20000U     /* FOC ISR rate (center-aligned RCR=1, every 2nd underflow) */
 #define FOC_ISR_DT_SECONDS (1.0f / (float)FOC_ISR_FREQ_HZ)
 #define FOC_ALIGN_TIME_MS 1000U      /* Rotor alignment time in ms */
-#define FOC_ALIGN_VOLTAGE 6.0f       /* Alignment voltage (high for repeatable offset with 20pp motor) */
+#define FOC_ALIGN_VOLTAGE 1.0f       /* Alignment voltage (high for repeatable offset with 20pp motor) */
 #define ENCODER_OFFSET_TRIM_RAD 0.0f   /* Trim disabled - fix bus voltage ratio instead */
 #define BUS_V_UPDATE_MS   2000U      /* Bus voltage refresh every 2s */
 #define UART_TX_BUF_SIZE  256U       /* Non-blocking UART transmit buffer */
@@ -83,9 +83,9 @@
 #define MIN_BUS_VOLTAGE   8.0f      /* Undervoltage shutdown threshold (V) */
 
 /* Position control (outer loop) */
-#define POS_KP            0.5f      /* Position P gain (A/rad) — enough to overcome cogging */
-#define POS_KI            1.2f      /* Position I gain (A/(rad·s)) — pushes through cogging detents */
-#define POS_KD            0.02f     /* Position D gain (A/(rad/s)) — damping */
+#define POS_KP            0.3f      /* Position P gain (A/rad) — enough to overcome cogging */
+#define POS_KI            0.5f      /* Position I gain (A/(rad·s)) — pushes through cogging detents */
+#define POS_KD            0.01f     /* Position D gain (A/(rad/s)) — damping */
 #define POS_IQ_LIMIT      2.5f      /* Max iq command from position loop (A) */
 #define POS_KI_LIMIT      2.5f      /* Anti-windup: max integrator contribution (A) — match IQ_LIMIT */
 #define POS_LOOP_MS       1U        /* Position loop period (ms) */

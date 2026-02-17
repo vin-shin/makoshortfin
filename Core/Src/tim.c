@@ -101,7 +101,7 @@ void MX_TIM1_Init(void)
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
   /* 400 ns deadtime: TIM1 runs at 170 MHz, so 1 tick = ~5.88 ns. 400 ns / 5.88 ns ~ 68 ticks. */
-  sBreakDeadTimeConfig.DeadTime = 38;
+  sBreakDeadTimeConfig.DeadTime = 25;
   sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
   sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
   sBreakDeadTimeConfig.BreakFilter = 0;
