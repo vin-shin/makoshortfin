@@ -18,12 +18,12 @@ extern volatile float g_vd;
 extern volatile float g_vq;
 extern volatile float g_bus_voltage;
 extern volatile float g_mech_angle;
+extern volatile float g_elec_angle;
 extern volatile float g_iq_ref;
 extern volatile uint32_t g_isr_max_cycles;
 extern volatile uint8_t g_fault_code;
 
-/* Position target (written by main loop) */
-extern float g_pos_target;
+extern float g_encoder_offset;
 
 void UART_Init(void)
 {
@@ -31,6 +31,9 @@ void UART_Init(void)
     /* Enable TXE interrupt for async TX */
     NVIC_SetPriority(USART1_IRQn, 3);
     NVIC_EnableIRQ(USART1_IRQn);
+    
+    /* Explicitly enable the TXE interrupt here as well */
+    LL_USART_EnableIT_TXE(USART1);
 }
 
 /* Called from USART1_IRQHandler in stm32g4xx_it.c */
@@ -57,22 +60,38 @@ void UART_Printf(const char *fmt, ...)
     if (len <= 0) return;
     if (len > (int)sizeof(local)) len = (int)sizeof(local);
 
+    /* Try interrupt-driven first */
+    uint32_t bytes_buffered = 0;
     for (int i = 0; i < len; i++) {
         uint16_t next = (s_tx_head + 1) % UART_TX_BUF_SIZE;
-        if (next == s_tx_tail) break;  /* Buffer full, drop */
+        if (next == s_tx_tail) break;  /* Buffer full */
         s_tx_buf[s_tx_head] = local[i];
         s_tx_head = next;
+        bytes_buffered++;
     }
 
-    LL_USART_EnableIT_TXE(USART1);
+    if (bytes_buffered > 0) {
+        LL_USART_EnableIT_TXE(USART1);
+    }
+    
+    /* FALLBACK: Polled mode for remaining or if buffer full */
+    if (bytes_buffered < (uint32_t)len) {
+        for (uint32_t i = bytes_buffered; i < (uint32_t)len; i++) {
+            uint32_t timeout = 100000;
+            while (!LL_USART_IsActiveFlag_TXE(USART1) && --timeout) {}
+            if (timeout > 0) {
+                LL_USART_TransmitData8(USART1, (uint8_t)local[i]);
+            }
+        }
+    }
 }
 
 void UART_SendTelemetry(void)
 {
     static const char *fault_names[] = {"OK", "OC", "OV", "UV", "KILL"};
 
-    int32_t pos_deg = (int32_t)(g_mech_angle * RAD_TO_DEG_F);
-    int32_t tgt_deg = (int32_t)(g_pos_target * RAD_TO_DEG_F);
+    int32_t mec_deg = (int32_t)(g_mech_angle * RAD_TO_DEG_F);
+    int32_t elec_deg = (int32_t)(g_elec_angle * RAD_TO_DEG_F);
     int32_t id_ma = (int32_t)(g_id_meas * 1000.0f);
     int32_t iq_ma = (int32_t)(g_iq_meas * 1000.0f);
     int32_t iq_ref_ma = (int32_t)(g_iq_ref * 1000.0f);
@@ -82,17 +101,49 @@ void UART_SendTelemetry(void)
     uint8_t fc = g_fault_code;
     if (fc > 0) {
         const char *name = (fc < 5) ? fault_names[fc] : "UNK";
-        UART_Printf("FAULT:%s bus:%ld.%01ldV id:%ldmA iq:%ldmA\r\n",
+        UART_Printf("FAULT:%s mec:%ldd ele:%ldd id:%ldmA iq:%ldmA bus:%ldmV isr:%luus\r\n",
                      name,
-                     (long)(bus_mv / 1000), (long)((bus_mv % 1000) / 100),
-                     (long)id_ma, (long)iq_ma);
+                     (long)mec_deg, (long)elec_deg,
+                     (long)id_ma, (long)iq_ma, (long)bus_mv, (unsigned long)isr_us);
     } else {
-        UART_Printf("pos:%ld>%lddeg ref:%ldmA iq:%ldmA id:%ldmA bus:%ld.%01ldV %luus\r\n",
-                     (long)pos_deg, (long)tgt_deg,
-                     (long)iq_ref_ma, (long)iq_ma, (long)id_ma,
-                     (long)(bus_mv / 1000), (long)((bus_mv % 1000) / 100),
-                     (unsigned long)isr_us);
+        UART_Printf("mec:%ldd ele:%ldd ref:%ldmA id:%ldmA iq:%ldmA bus:%ldmV isr:%luus\r\n",
+                     (long)mec_deg, (long)elec_deg, (long)iq_ref_ma,
+                     (long)id_ma, (long)iq_ma, (long)bus_mv, (unsigned long)isr_us);
     }
 
     g_isr_max_cycles = 0;
+}
+
+/* ===== Direct polled transmit (no interrupts, for diagnostics) ===== */
+void UART_SendCharPolled(char c)
+{
+    /* Wait for TXE with timeout */
+    uint32_t timeout = 1000000;
+    while (!LL_USART_IsActiveFlag_TXE(USART1) && --timeout) {}
+    if (timeout > 0) {
+        LL_USART_TransmitData8(USART1, (uint8_t)c);
+    }
+}
+
+void UART_SendStringPolled(const char *str)
+{
+    if (!str) return;
+    for (int i = 0; str[i] != '\0'; i++) {
+        UART_SendCharPolled(str[i]);
+    }
+}
+
+/* Flush pending TX buffer by waiting for all data to transmit */
+void UART_Flush(void)
+{
+    /* Wait for buffer to empty */
+    uint32_t timeout = 1000000;
+    while (s_tx_head != s_tx_tail && --timeout) {
+        /* Wait */
+    }
+    /* Wait for UART to finish current byte */
+    timeout = 1000000;
+    while (!LL_USART_IsActiveFlag_TC(USART1) && --timeout) {
+        /* Wait for transmission complete */
+    }
 }

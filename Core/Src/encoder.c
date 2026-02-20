@@ -4,8 +4,10 @@
 #include "stm32g4xx_ll_spi.h"
 #include "stm32g4xx_ll_gpio.h"
 
-static float s_offset_rad = 0.0f;
-static float s_last_good = 0.0f;
+static uint16_t s_last_good = 0;
+static uint16_t s_debug_rx1 = 0;
+static uint16_t s_debug_rx2 = 0;
+static uint8_t s_first_read = 1;
 
 void Encoder_Init(void)
 {
@@ -42,8 +44,9 @@ static inline uint16_t SPI3_Transfer16(uint16_t tx)
     return rx;
 }
 
-/* Read 15-bit angle from A1333 via 2-frame pipelined SPI */
-Encoder_Status_t Encoder_ReadAngle(float *mech_angle_rad)
+/* Read 15-bit angle from A1333 via 2-frame pipelined SPI.
+ * Returns raw counts [0, 32767] — no float conversion performed here. */
+Encoder_Status_t Encoder_ReadAngle(uint16_t *raw_counts)
 {
     /* Frame 1: send ANG15 read command */
     LL_GPIO_ResetOutputPin(ENC_CS_PORT, ENC_CS_PIN);
@@ -51,7 +54,7 @@ Encoder_Status_t Encoder_ReadAngle(float *mech_angle_rad)
     LL_GPIO_SetOutputPin(ENC_CS_PORT, ENC_CS_PIN);
 
     if (rx1 == 0xFFFF) {
-        *mech_angle_rad = s_last_good;
+        *raw_counts = s_last_good;
         return ENC_ERR_SPI;
     }
 
@@ -65,25 +68,28 @@ Encoder_Status_t Encoder_ReadAngle(float *mech_angle_rad)
     LL_GPIO_SetOutputPin(ENC_CS_PORT, ENC_CS_PIN);
 
     if (rx2 == 0xFFFF) {
-        *mech_angle_rad = s_last_good;
+        *raw_counts = s_last_good;
         return ENC_ERR_SPI;
     }
 
-    /* Extract 15-bit angle and convert to radians */
     uint16_t ang_raw = rx2 & 0x7FFF;
-    float angle = (float)ang_raw * (TWO_PI_F / (float)ENCODER_COUNTS);
+    s_last_good = ang_raw;
+    *raw_counts = ang_raw;
 
-    s_last_good = angle;
-    *mech_angle_rad = angle;
+    /* Store raw data for debugging (first read only) */
+    if (s_first_read) {
+        s_first_read = 0;
+        s_debug_rx1 = rx1;
+        s_debug_rx2 = rx2;
+    }
+
     return ENC_OK;
 }
 
-void Encoder_SetOffset(float offset_rad)
+/* Get last SPI debug data */
+void Encoder_GetDebugData(uint16_t *rx1, uint16_t *rx2)
 {
-    s_offset_rad = offset_rad;
+    *rx1 = s_debug_rx1;
+    *rx2 = s_debug_rx2;
 }
 
-float Encoder_GetOffset(void)
-{
-    return s_offset_rad;
-}

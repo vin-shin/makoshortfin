@@ -9,8 +9,8 @@ typedef enum {
 } Encoder_Status_t;
 
 void Encoder_Init(void);
-Encoder_Status_t Encoder_ReadAngle(float *mech_angle_rad);
-void Encoder_SetOffset(float offset_rad);
-float Encoder_GetOffset(void);
+/* Returns raw 15-bit mechanical count [0, 32767] — no float conversion */
+Encoder_Status_t Encoder_ReadAngle(uint16_t *raw_counts);
+void Encoder_GetDebugData(uint16_t *rx1, uint16_t *rx2);
 
 #endif /* ENCODER_H */

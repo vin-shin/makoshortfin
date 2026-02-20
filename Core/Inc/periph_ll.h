@@ -28,7 +28,7 @@ void LL_OPAMP3_Init(void);
 void LL_FDCAN1_Init(void);
 void LL_IWDG_Init(void);
 
-void LL_ADC_Calibrate_All(void);
+int LL_ADC_Calibrate_All(void);  /* Returns 0 on success, error code on failure */
 void LL_ADC_Start_All(void);
 
 #endif /* PERIPH_LL_H */

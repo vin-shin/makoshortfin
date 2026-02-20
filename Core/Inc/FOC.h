@@ -10,7 +10,7 @@ typedef struct {
     float ib;
     float ic;
     float bus_v;
-    float elec_angle;
+    uint16_t elec_counts;   /* 15-bit electrical angle [0, 32767] — no radians needed */
 } FOC_Sensors_t;
 
 typedef struct {
@@ -28,22 +28,9 @@ void FOC_Reset(void);
 void FOC_SetCurrentRefs(float id_ref, float iq_ref);
 void FOC_SetGains(float kp_d, float ki_d, float kp_q, float ki_q);
 void FOC_Run(const FOC_Sensors_t *sensors, FOC_Output_t *output);
-void FOC_SinCos(float angle_rad, float *sin_out, float *cos_out);
-static inline float FOC_WrapAngle2Pi(float angle_rad)
-{
-    if (angle_rad >= TWO_PI_F) {
-        angle_rad -= TWO_PI_F;
-    } else if (angle_rad < 0.0f) {
-        angle_rad += TWO_PI_F;
-    }
-    return angle_rad;
-}
 
-static inline float FOC_WrapAnglePi(float angle_rad)
-{
-    angle_rad += PI_F;
-    angle_rad = FOC_WrapAngle2Pi(angle_rad);
-    return angle_rad - PI_F;
-}
+/* CORDIC sin/cos directly from 15-bit count [0, 32767].
+ * Conversion: q31 = (counts - 16384) << 17  — one subtract, one shift, no float. */
+void FOC_SinCos(uint16_t angle_counts, float *sin_out, float *cos_out);
 
 #endif /* FOC_H */

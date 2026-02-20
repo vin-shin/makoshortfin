@@ -1,10 +1,15 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+/* ===== Debug Options ===== */
+#define ENABLE_WATCHDOG         0       /* Set to 0 to disable watchdog for PCB testing */
+#define PWM_ONLY_MODE           0       /* 1 = keep PWM running at 50% with FOC disabled; 0 = enable FOC */
+#define FOC_ENABLE_DIAGNOSTICS  0       /* 1 = capture diagnostic variables (adds ISR overhead); 0 = disable for max performance */
+
 /* ===== Motor Parameters ===== */
 #define MOTOR_POLE_PAIRS        20U
-#define MOTOR_MAX_CURRENT_A     10.0f
-#define MOTOR_RATED_CURRENT_A   15.0f
+#define MOTOR_MAX_CURRENT_A     100.0f
+#define MOTOR_RATED_CURRENT_A   100.0f
 
 /* ===== FOC Timing ===== */
 #define FOC_ISR_FREQ_HZ         20000U
@@ -16,38 +21,50 @@
 
 /* ===== Angle Prediction ===== */
 #define FOC_ANGLE_PREDICT_ENABLE        1
-#define FOC_ANGLE_PREDICT_DELAY_S       (0.6f * FOC_ISR_DT_S)
+#define FOC_ANGLE_PREDICT_DELAY_S       (1.43 * FOC_ISR_DT_S)  /* Full PWM period prediction */
 #define FOC_ANGLE_PREDICT_MAX_RAD       0.52359878f  /* 30 deg */
-#define FOC_ANGLE_PREDICT_MIN_SPEED_RAD_S 5.0f
+#define FOC_ANGLE_PREDICT_MIN_SPEED_RAD_S 1.0f  /* Activate at low speeds */
 #define FOC_ANGLE_SPEED_ALPHA           0.2f
 
 /* ===== Current Loop PI Gains ===== */
-#define FOC_KP_D                0.0229f
-#define FOC_KI_D                77.5f
-#define FOC_KP_Q                0.0229f
-#define FOC_KI_Q                77.5f
+#define FOC_KP_D                0.0307f   /* Proportional only - conservative for d-axis stability */
+#define FOC_KI_D                35.40f    /* No d-axis integration */
+#define FOC_KP_Q                0.0307f   /* Increased 2.5x from 0.1 - faster response, still stable */
+#define FOC_KI_Q                35.40f   /* Tiny integrator (0.02) - improves steady-state without windup */
 
-/* ===== Position Loop PID Gains ===== */
-#define POS_KP                  0.5f
-#define POS_KI                  1.2f
-#define POS_KD                  0.02f
-#define POS_IQ_LIMIT_A          2.5f
-#define POS_KI_LIMIT_A          2.5f
-#define POS_LOOP_HZ             1000U
-#define POS_DERIV_ALPHA         0.06f   /* LP filter for derivative, fc~10Hz @ 1kHz */
 
 /* ===== Current Sensing ===== */
+/* Hardware: ACS72981 5V variant hall effect sensors (no voltage divider)
+ * - Supply: 5V, Output: 2.5V @ 0A (VCC/2)
+ * - Sensitivity: 20 mV/A (verify from your specific part number)
+ * - Output impedance: <1Ω, Bandwidth: 250 kHz
+ * - Connected directly to 3.3V ADC inputs
+ * WARNING: ADC clipping limits with 2.5V zero-point:
+ *   - Positive: (3300mV - 2500mV) / 20mV/A = +40A max before clipping
+ *   - Negative: (2500mV - 0mV) / 20mV/A = -125A max before clipping
+ *   - Current limits (10A overcurrent) are well within safe range
+ * ADC Configuration:
+ * - Hardware-triggered injected conversions from TIM1_TRGO (eliminating ISR jitter)
+ * - Sampling time: 12.5 cycles @ 42.5MHz = 294ns (optimal for hall sensors)
+ * - 16x oversampling with right-shift 4 (effective 12-bit with reduced noise)
+ * - Total conversion time: ~600ns per channel
+ */
 #define ADC_VREF_NOM_MV         3300U
 #define ADC_MAX_COUNTS          4095U
-#define CURRENT_SENSE_MV_PER_A  20.0f
-#define CURRENT_ZERO_NOM_MV     2500U
-#define CURRENT_FILTER_ALPHA    0.15f   /* IIR alpha, fc~500Hz @ 20kHz */
-#define INVERT_CURRENT_POLARITY 1       /* 1 = negate measured current */
+#define ADC2_MAX_COUNTS         4095U  /* Observed dual DMA samples are 12-bit for ADC2 */
+#define CURRENT_SENSE_MV_PER_A  20.0f  /* ACS72981 sensitivity - verify your part number! */
+#define CURRENT_ZERO_NOM_MV     2500U  /* 5V variant: VCC/2 = 2.5V at zero current */
+#define CURRENT_FILTER_ALPHA    0.7f   /* IIR filter: fc~3800Hz, phase lag ~1.5° @ 100Hz, ~3° @ 200Hz */
+#define INVERT_CURRENT_POLARITY 1       /* 0 = don't negate measured current */
+#define INVERT_ENCODER_ANGLE    0       /* 1 = negate encoder angle to correct rotation direction */
+#define ZERO_CURRENT_THRESHOLD  0.1f    /* A - drift correction active below this current */
+#define ZERO_DRIFT_ALPHA        0.00001f /* Drift integrator alpha, ~5s per 0.1A error */
+#define VDDA_RECALIB_MS         10000U  /* Re-calibrate VDDA every 10 seconds */
 
 /* ===== Bus Voltage ===== */
-#define BUS_V_DIVIDER_RATIO     17.0f
-#define BUS_V_MIN               8.0f
-#define BUS_V_MAX               50.0f
+#define BUS_V_DIVIDER_RATIO     21.0f   /* Hardware: 200k top + 10k bottom = 21x divider */
+#define BUS_V_MIN               20.0f   /* Minimum bus voltage (24V nominal - 4V margin) */
+#define BUS_V_MAX               28.0f   /* Maximum bus voltage (24V nominal + 4V margin) */
 #define BUS_V_UPDATE_MS         1000U
 #define BUS_V_FILTER_ALPHA      0.2f
 #define BUS_V_OUTLIER_THRESH    2.0f    /* Reject readings >2V from filtered */
@@ -63,21 +80,16 @@
 
 /* ===== Rotor Alignment ===== */
 #define ALIGN_VOLTAGE_V         1.0f
-#define ALIGN_TIME_MS           1000U
-#define ALIGN_RAMPDOWN_MS       220U
+#define ALIGN_TIME_MS           800U    /* Reduced from 1000ms for faster startup */
+#define ALIGN_RAMPDOWN_MS       200U
 
 /* ===== Safety ===== */
-#define OVERCURRENT_LIMIT_A     8.0f
+#define OVERCURRENT_LIMIT_A     100.0f  /* DISABLED for tuning - set high */
 
 /* ===== UART Telemetry ===== */
 #define UART_TX_BUF_SIZE        256U
 #define UART_BAUD               115200U
 #define TELEMETRY_PERIOD_MS     20U
-
-/* ===== Position Control Startup ===== */
-#define POS_TARGET_A_DEG        0.0f
-#define POS_TARGET_B_DEG        180.0f
-#define POS_SWITCH_MS           2000U
 
 /* ===== Pin Assignments ===== */
 /* TIM1 PWM (AF6) */

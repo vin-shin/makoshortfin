@@ -24,7 +24,6 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/periph_ll.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/FOC.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/encoder.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/control.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/uart_telem.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32g4xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/sysmem.c

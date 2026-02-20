@@ -13,6 +13,20 @@ static float s_ki_q = FOC_KI_Q;
 static float s_id_integrator = 0.0f;
 static float s_iq_integrator = 0.0f;
 
+/* Diagnostic exports */
+volatile float g_foc_ia_raw = 0.0f;
+volatile float g_foc_ib_raw = 0.0f;
+volatile float g_foc_ic_raw = 0.0f;
+volatile float g_foc_i_alpha = 0.0f;
+volatile float g_foc_i_beta = 0.0f;
+volatile float g_foc_elec_angle = 0.0f;
+volatile float g_foc_sin_e = 0.0f;
+volatile float g_foc_cos_e = 0.0f;
+volatile float g_foc_iq_cmd = 0.0f;
+volatile float g_foc_iq_meas = 0.0f;
+volatile float g_foc_vq_output = 0.0f;
+volatile uint32_t g_foc_diag_counter = 0;
+
 void FOC_Init(void)
 {
     /* Enable CORDIC clock */
@@ -40,21 +54,12 @@ void FOC_SetGains(float kp_d, float ki_d, float kp_q, float ki_q)
     s_ki_q = ki_q;
 }
 
-/* CORDIC hardware sin/cos - Q31 format, 5 iterations */
-void FOC_SinCos(float angle_rad, float *sin_out, float *cos_out)
+/* CORDIC hardware sin/cos from 15-bit count [0, 32767].
+ * [0, 32767] → [-16384, 16383] (subtract 16384) → Q31 (<< 17).
+ * One subtract, one shift — no float, no wrapping, no clamp. */
+void FOC_SinCos(uint16_t angle_counts, float *sin_out, float *cos_out)
 {
-    /* Wrap angle to [-pi, pi] then normalize to [-1, 1] for Q31 */
-    float wrapped = fmodf(angle_rad + PI_F, TWO_PI_F);
-    if (wrapped < 0.0f) wrapped += TWO_PI_F;
-    wrapped -= PI_F;
-
-    float norm = wrapped * (1.0f / PI_F);
-
-    /* Clamp to valid Q31 range */
-    if (norm > 0.999999f) norm = 0.999999f;
-    if (norm < -1.0f) norm = -1.0f;
-
-    int32_t angle_q31 = (int32_t)(norm * 2147483648.0f);
+    int32_t angle_q31 = ((int32_t)angle_counts - 16384) << 17;
 
     /* Configure CORDIC: cosine function, 5 iterations, 2 results */
     CORDIC->CSR = (0U << CORDIC_CSR_FUNC_Pos)
@@ -83,6 +88,14 @@ void FOC_Run(const FOC_Sensors_t *sensors, FOC_Output_t *output)
     float ic = sensors->ic;
     float bus_v = sensors->bus_v;
 
+#if FOC_ENABLE_DIAGNOSTICS
+    /* Diagnostic capture */
+    g_foc_ia_raw = ia;
+    g_foc_ib_raw = ib;
+    g_foc_ic_raw = ic;
+    g_foc_iq_cmd = s_iq_ref;
+#endif
+
     /* Safety: zero output if bus voltage invalid */
     if (bus_v <= 0.0f) {
         output->duty_u = 0.5f;
@@ -97,16 +110,34 @@ void FOC_Run(const FOC_Sensors_t *sensors, FOC_Output_t *output)
 
     /* Sin/cos of electrical angle via CORDIC */
     float sin_e, cos_e;
-    FOC_SinCos(sensors->elec_angle, &sin_e, &cos_e);
+    uint16_t angle_counts = sensors->elec_counts;
+#if INVERT_ENCODER_ANGLE
+    angle_counts = (uint16_t)(32768U - angle_counts) & 0x7FFF;
+#endif
+    FOC_SinCos(angle_counts, &sin_e, &cos_e);
+
+#if FOC_ENABLE_DIAGNOSTICS
+    /* Diagnostic capture */
+    g_foc_elec_angle = (float)angle_counts * (TWO_PI_F / 32768.0f);
+    g_foc_sin_e = sin_e;
+    g_foc_cos_e = cos_e;
+#endif
 
     float i_sum = (ia + ib + ic) * (1.0f / 3.0f);
     ia -= i_sum;
     ib -= i_sum;
     ic -= i_sum;
 
-    /* Clarke transform: 3-phase -> alpha-beta */
-    float i_alpha = ia;
-    float i_beta = (ia + 2.0f * ib) * INV_SQRT3_F;
+    /* Clarke transform (power-invariant): 3-phase -> alpha-beta */
+    const float clarke_k = 0.81649658f; /* sqrt(2/3) */
+    float i_alpha = clarke_k * ia;
+    float i_beta = clarke_k * (ia + 2.0f * ib) * INV_SQRT3_F;
+    
+#if FOC_ENABLE_DIAGNOSTICS
+    /* Diagnostic capture */
+    g_foc_i_alpha = i_alpha;
+    g_foc_i_beta = i_beta;
+#endif
 
     /* Park transform: alpha-beta -> d-q (rotating frame) */
     float id = i_alpha * cos_e + i_beta * sin_e;
@@ -114,6 +145,11 @@ void FOC_Run(const FOC_Sensors_t *sensors, FOC_Output_t *output)
 
     output->id_meas = id;
     output->iq_meas = iq;
+    
+#if FOC_ENABLE_DIAGNOSTICS
+    /* Diagnostic capture */
+    g_foc_iq_meas = iq;
+#endif
 
     /* PI current controllers */
     float id_err = s_id_ref - id;
@@ -121,38 +157,54 @@ void FOC_Run(const FOC_Sensors_t *sensors, FOC_Output_t *output)
 
     float v_limit = bus_v * SVPWM_V_LIMIT;
 
-    /* D-axis PI */
-    s_id_integrator += s_ki_d * id_err * FOC_ISR_DT_S;
-    if (s_id_integrator > v_limit) s_id_integrator = v_limit;
-    if (s_id_integrator < -v_limit) s_id_integrator = -v_limit;
+    /* D-axis PI with anti-windup */
     float vd = s_kp_d * id_err + s_id_integrator;
-
-    /* Q-axis PI */
-    s_iq_integrator += s_ki_q * iq_err * FOC_ISR_DT_S;
-    if (s_iq_integrator > v_limit) s_iq_integrator = v_limit;
-    if (s_iq_integrator < -v_limit) s_iq_integrator = -v_limit;
+    
+    /* Q-axis PI with anti-windup */
     float vq = s_kp_q * iq_err + s_iq_integrator;
 
-    /* Circular voltage limiting */
+    /* Circular voltage limiting (check if saturating) */
     float v_mag_sq = vd * vd + vq * vq;
     float v_lim_sq = v_limit * v_limit;
-    if (v_mag_sq > v_lim_sq) {
+    int32_t saturated = (v_mag_sq > v_lim_sq) ? 1 : 0;
+    
+    if (saturated) {
         float scale = v_limit / sqrtf(v_mag_sq);
         vd *= scale;
         vq *= scale;
+
+        /* Anti-windup: Do NOT integrate when saturated */
+        /* Integrators are unchanged */
+    } else {
+        /* Only integrate when NOT saturated */
+        s_id_integrator += s_ki_d * id_err * FOC_ISR_DT_S;
+        s_iq_integrator += s_ki_q * iq_err * FOC_ISR_DT_S;
+        
+        /* Secondary clamp as safety net (shouldn't trigger often) */
+        if (s_id_integrator > v_limit) s_id_integrator = v_limit;
+        if (s_id_integrator < -v_limit) s_id_integrator = -v_limit;
+        if (s_iq_integrator > v_limit) s_iq_integrator = v_limit;
+        if (s_iq_integrator < -v_limit) s_iq_integrator = -v_limit;
     }
 
     output->vd = vd;
     output->vq = vq;
+    
+#if FOC_ENABLE_DIAGNOSTICS
+    /* Diagnostic capture */
+    g_foc_vq_output = vq;
+    g_foc_diag_counter++;
+#endif
 
     /* Inverse Park transform: d-q -> alpha-beta */
     float v_alpha = vd * cos_e - vq * sin_e;
     float v_beta = vd * sin_e + vq * cos_e;
 
-    /* Inverse Clarke + SVPWM */
-    float vu = v_alpha;
-    float vv = -0.5f * v_alpha + 0.5f * SQRT3_F * v_beta;
-    float vw = -0.5f * v_alpha - 0.5f * SQRT3_F * v_beta;
+    /* Inverse Clarke (power-invariant): alpha-beta -> 3-phase */
+    const float inv_clarke_k = 1.2247449f; /* sqrt(3/2) */
+    float vu = inv_clarke_k * v_alpha;
+    float vv = inv_clarke_k * (-0.5f * v_alpha + 0.5f * SQRT3_F * v_beta);
+    float vw = inv_clarke_k * (-0.5f * v_alpha - 0.5f * SQRT3_F * v_beta);
 
     /* Min-max injection (midpoint clamping) */
     float v_max = fmaxf(vu, fmaxf(vv, vw));
