@@ -397,8 +397,8 @@ static void CurrentStepTest(void)
     UART_Printf("\r\n=== CURRENT TEST: 2A for 3s ===\r\n");
     UART_Printf("ms | iq_mA | id_mA | elec_deg\r\n");
 
-    FOC_SetCurrentRefs(0.0f, 1.0f);
-    g_iq_ref = 1.0f;
+    FOC_SetCurrentRefs(0.0f, 2.0f);
+    g_iq_ref = 2.0f;
 
     uint32_t start = HAL_GetTick();
     while ((int32_t)(HAL_GetTick() - start) < 10000) {

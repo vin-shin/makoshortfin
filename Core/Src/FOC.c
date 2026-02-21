@@ -159,9 +159,16 @@ void FOC_Run(const FOC_Sensors_t *sensors, FOC_Output_t *output)
 
     /* D-axis PI with anti-windup */
     float vd = s_kp_d * id_err + s_id_integrator;
-    
+
     /* Q-axis PI with anti-windup */
     float vq = s_kp_q * iq_err + s_iq_integrator;
+
+    /* dq decoupling feedforward: cancel cross-coupling before voltage limit.
+     * Vd -= ωe·L·iq  (cancels +ωe·L·iq disturbance in d-axis plant)
+     * Vq += ωe·L·id  (cancels -ωe·L·id disturbance in q-axis plant) */
+    float omega_e = sensors->omega_e;
+    vd -= omega_e * MOTOR_PHASE_INDUCTANCE_H * iq;
+    vq += omega_e * MOTOR_PHASE_INDUCTANCE_H * id;
 
     /* Circular voltage limiting (check if saturating) */
     float v_mag_sq = vd * vd + vq * vq;

@@ -10,6 +10,7 @@ typedef struct {
     float ib;
     float ic;
     float bus_v;
+    float omega_e;          /* Electrical angular velocity (rad/s) for dq decoupling */
     uint16_t elec_counts;   /* 15-bit electrical angle [0, 32767] — no radians needed */
 } FOC_Sensors_t;
 

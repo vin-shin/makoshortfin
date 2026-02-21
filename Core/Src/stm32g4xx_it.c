@@ -304,6 +304,7 @@ void TIM1_UP_TIM16_IRQHandler(void)
         .ib = ib,
         .ic = ic,
         .bus_v = g_bus_voltage,
+        .omega_e = s_elec_speed_f,
         .elec_counts = elec_counts_used,
     };
 

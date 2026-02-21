@@ -10,6 +10,8 @@
 #define MOTOR_POLE_PAIRS        20U
 #define MOTOR_MAX_CURRENT_A     100.0f
 #define MOTOR_RATED_CURRENT_A   100.0f
+#define MOTOR_PHASE_INDUCTANCE_H   0.0000543f  /* Per-phase inductance. Measured 90-127uH phase-to-phase -> /2 = 45-63.5uH, mid 54.3uH */
+#define MOTOR_PHASE_RESISTANCE_OHM 0.085f      /* Per-phase resistance. Measured 0.17 Ohm phase-to-phase -> /2 = 85mOhm */
 
 /* ===== FOC Timing ===== */
 #define FOC_ISR_FREQ_HZ         20000U
